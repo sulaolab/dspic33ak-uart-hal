@@ -134,4 +134,6 @@ You still need project-specific code for:
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+MIT No Attribution License (MIT-0). See [LICENSE](LICENSE).
+
+Attribution is appreciated but not required.
