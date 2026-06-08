@@ -2,13 +2,13 @@
 
 Small, readable UART HAL for Microchip dsPIC33AK devices.
 
-This repository provides a reusable byte-stream UART driver with a clean public API.  The public API avoids exposing XC-DSC / DFP bitfield types, while the device-specific register mapping is isolated in small internal files.
+This repository provides a reusable byte-stream UART driver with a clean public API. The public API avoids exposing XC-DSC / DFP bitfield types, while the device-specific register mapping is isolated in small internal files.
 
 ## Status
 
 Initial public release candidate.
 
-This HAL was developed and validated in a Perseus dsPIC33AK512MPS512 project using UART1.  In that project it was exercised through a legacy compatibility layer, stdio retargeting, and an RX ISR ring integration.  Those integration layers are intentionally not part of this repository; this repository contains only the reusable UART HAL.
+This HAL was developed and smoke-tested on a dsPIC33AK512MPS512 project using UART1. The project-specific compatibility, stdio retargeting, and RX ISR ring layers used during bring-up are intentionally not part of this repository.
 
 ## Repository layout
 
@@ -21,10 +21,6 @@ src/
   dspic33ak_uart_reg.h      Internal register / bit-mask helper definitions
   dspic33ak_uart_ring.h     Small byte ring utility
   dspic33ak_uart_ring.c     Small byte ring utility implementation
-
-docs/
-  PUBLIC_BOUNDARY.md        What belongs in this HAL and what does not
-  VALIDATION.md             Validation notes from the Perseus bring-up
 ```
 
 ## Design policy
@@ -33,8 +29,8 @@ docs/
 - Board-specific PPS / GPIO / clock routing stays outside this HAL.
 - `printf()`, `read()`, `write()`, and other stdio retargeting stay outside this HAL.
 - Application console / command parsing stays outside this HAL.
-- Interrupt vector ownership stays outside this HAL.  A project may build an ISR ring or DMA layer on top of this HAL, but the vector name itself is project/integration-specific.
-- Public functions are placed near the top of each source file.  Static helper functions are placed near the bottom, with only prototypes near the top when needed.
+- Interrupt vector ownership stays outside this HAL. A project may build an ISR ring or DMA layer on top of this HAL, but the vector name itself is project/integration-specific.
+- Public functions are placed near the top of each source file. Static helper functions are placed near the bottom, with only prototypes near the top when needed.
 
 ## Public API overview
 
@@ -121,11 +117,11 @@ src/dspic33ak_uart_ring.c
 
 Add `src/` to your include path.
 
-The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation.  It is part of the source distribution, but user application code should normally include only `dspic33ak_uart.h`.
+The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally include only `dspic33ak_uart.h`.
 
 ## Scope and limitations
 
-This repository provides a blocking/polling UART byte-stream HAL.  It does not provide a complete board support package.
+This repository provides a blocking/polling UART byte-stream HAL. It does not provide a complete board support package.
 
 You still need project-specific code for:
 
@@ -138,4 +134,4 @@ You still need project-specific code for:
 
 ## License
 
-MIT License.  See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
