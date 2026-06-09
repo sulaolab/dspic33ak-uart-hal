@@ -22,7 +22,15 @@ extern "C" {
 /* ========================================================================== */
 
 /*
- * Small, readable dsPIC33AK UART byte-stream HAL.
+ * Small, readable dsPIC33AK CLKGEN8 UART byte-stream HAL.
+ *
+ * Clock assumption:
+ *   - This HAL selects the UART clock source as CLKGEN8 (UxCONbits.CLKSEL) and
+ *     uses fractional baud mode. The caller passes the resulting CLKGEN8 frequency
+ *     as config.uart_clk_hz; the HAL computes the baud divisor from it.
+ *   - Board/application code must configure (route/enable) CLKGEN8 appropriately
+ *     before calling dspic33ak_uart_init(). Clock generator bring-up, PPS, and
+ *     GPIO routing remain outside this HAL.
  *
  * Design policy:
  *   - Public API does not expose XC-DSC / DFP bitfield types.
@@ -77,6 +85,28 @@ typedef enum {
     DSPIC33AK_UART_PARITY_ODD
 } dspic33ak_uart_parity_t;
 
+/*
+ * RX backend selection (per instance).
+ *
+ *   POLLING  - RX is read directly from the hardware RX FIFO; no RX interrupt is
+ *              enabled. The rx_ring_* / rx_irq_priority config fields are ignored.
+ *   ISR_RING - dspic33ak_uart_init() sets up the interrupt-driven RX ring (see
+ *              dspic33ak_uart_rx_isr_ring.h): the RX ISR drains the FIFO into a caller-
+ *              provided software ring, and rx_ready/read_byte/rx_flush operate on
+ *              that ring instead of the FIFO. Requires rx_ring_buffer != NULL,
+ *              rx_ring_buffer_size >= 2, and uses rx_irq_priority.
+ *
+ * Selecting the backend per instance (rather than one global compile-time switch)
+ * lets a build mix modes, e.g. UART1 console = ISR ring, UART2 log = polling.
+ *
+ * Only POLLING and ISR_RING are valid; dspic33ak_uart_init() rejects any other
+ * rx_mode value with DSPIC33AK_UART_ERR_INVALID_ARG.
+ */
+typedef enum {
+    DSPIC33AK_UART_RX_MODE_POLLING = 0,
+    DSPIC33AK_UART_RX_MODE_ISR_RING
+} dspic33ak_uart_rx_mode_t;
+
 typedef struct {
     uint32_t uart_clk_hz;
     uint32_t baudrate;
@@ -94,7 +124,41 @@ typedef struct {
     dspic33ak_uart_parity_t parity;
     bool enable_tx;
     bool enable_rx;
+
+    /* RX backend (see dspic33ak_uart_rx_mode_t). The rx_ring_* / rx_irq_priority
+     * fields are used only when rx_mode == DSPIC33AK_UART_RX_MODE_ISR_RING. The
+     * ring buffer storage is caller-provided so the HAL holds no implicit RAM. */
+    dspic33ak_uart_rx_mode_t rx_mode;
+    uint8_t  *rx_ring_buffer;
+    uint16_t  rx_ring_buffer_size;
+    uint8_t   rx_irq_priority;
 } dspic33ak_uart_config_t;
+
+/*
+ * RX runtime status snapshot (backend-aware).
+ *
+ * This is different from dspic33ak_uart_status_t:
+ *   - dspic33ak_uart_status_t      is a function return code.
+ *   - dspic33ak_uart_rx_status_t   is runtime RX state / counters.
+ *
+ * In ISR ring mode the counters are copied from the RX ISR ring backend. In
+ * polling mode rx_mode is POLLING and the backend-specific counters are zero
+ * (the polling path keeps no counters). Lets callers read RX diagnostics without
+ * knowing or branching on the configured backend.
+ */
+typedef struct {
+    dspic33ak_uart_rx_mode_t rx_mode;
+
+    uint32_t rx_isr_count;
+    uint32_t rx_byte_count;
+    uint32_t rx_fifo_overflow_count;
+    uint32_t framing_error_count;
+    uint32_t parity_error_count;
+    uint32_t autobaud_overflow_count;
+    uint32_t tx_collision_count;
+    uint32_t rx_ring_overflow_count;
+    uint32_t rx_max_drain_count;
+} dspic33ak_uart_rx_status_t;
 
 /* ========================================================================== */
 /* Public API                                                                 */
@@ -141,6 +205,24 @@ size_t dspic33ak_uart_read(
     size_t len);
 
 void dspic33ak_uart_rx_flush(
+    dspic33ak_uart_instance_t inst);
+
+/*
+ * Backend-aware RX status snapshot / clear.
+ *
+ * ISR ring mode reports/clears the RX ISR ring counters; polling mode reports a
+ * zeroed snapshot (rx_mode = POLLING) and clear is a no-op. Callers use these
+ * instead of the backend-specific dspic33ak_uart_rx_isr_status_* API so they
+ * stay backend-agnostic.
+ *
+ * Returns DSPIC33AK_UART_ERR_INVALID_ARG (status NULL), _ERR_NOT_PRESENT,
+ * _ERR_NOT_INITIALIZED, or DSPIC33AK_UART_OK.
+ */
+dspic33ak_uart_status_t dspic33ak_uart_rx_status_get(
+    dspic33ak_uart_instance_t inst,
+    dspic33ak_uart_rx_status_t *status);
+
+dspic33ak_uart_status_t dspic33ak_uart_rx_status_clear(
     dspic33ak_uart_instance_t inst);
 
 /* ========================================================================== */

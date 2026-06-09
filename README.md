@@ -2,35 +2,63 @@
 
 Small, readable UART HAL for Microchip dsPIC33AK devices.
 
-This repository provides a reusable byte-stream UART driver with a clean public API. The public API avoids exposing XC-DSC / DFP bitfield types, while the device-specific register mapping is isolated in small internal files.
+This repository provides a reusable byte-stream UART driver with a clean public API. The public API avoids exposing XC-DSC / DFP bitfield types, while device-specific register mapping is isolated in small internal files.
 
 ## Status
 
-Initial public release candidate.
+Public release candidate.
 
-This HAL was developed and smoke-tested on a dsPIC33AK512MPS512 project using UART1. The project-specific compatibility, stdio retargeting, and RX ISR ring layers used during bring-up are intentionally not part of this repository.
+This HAL was developed and smoke-tested on a dsPIC33AK512MPS512 project using UART1. It is intended to be reusable across dsPIC33AK projects where the board/application code owns clock setup, PPS routing, GPIO setup, interrupt vector definitions, and stdio retargeting.
+
+This version supports:
+
+* Polling RX mode
+* Interrupt-driven RX software-ring mode
+* Caller-provided RX ring buffer storage
+* dsPIC33AK UART clock source through CLKGEN8
+* 8N1 byte-stream operation
 
 ## Repository layout
 
 ```text
 src/
-  dspic33ak_uart.h          Public UART HAL API
-  dspic33ak_uart.c          UART HAL implementation
-  dspic33ak_uart_device.h   Device instance mapping interface
-  dspic33ak_uart_device.c   Device instance mapping implementation
-  dspic33ak_uart_reg.h      Internal register / bit-mask helper definitions
-  dspic33ak_uart_ring.h     Small byte ring utility
-  dspic33ak_uart_ring.c     Small byte ring utility implementation
+  dspic33ak_uart.h              Public UART HAL API
+  dspic33ak_uart.c              UART HAL implementation
+  dspic33ak_uart_device.h       Device instance mapping interface
+  dspic33ak_uart_device.c       Device instance mapping implementation
+  dspic33ak_uart_reg.h          Internal register / bit-mask helper definitions
+  dspic33ak_uart_rx_isr_ring.h  RX ISR ring backend API
+  dspic33ak_uart_rx_isr_ring.c  RX ISR ring backend implementation
 ```
 
 ## Design policy
 
-- Public API does not expose XC-DSC / DFP bitfield types.
-- Board-specific PPS / GPIO / clock routing stays outside this HAL.
-- `printf()`, `read()`, `write()`, and other stdio retargeting stay outside this HAL.
-- Application console / command parsing stays outside this HAL.
-- Interrupt vector ownership stays outside this HAL. A project may build an ISR ring or DMA layer on top of this HAL, but the vector name itself is project/integration-specific.
-- Public functions are placed near the top of each source file. Static helper functions are placed near the bottom, with only prototypes near the top when needed.
+* Public API does not expose XC-DSC / DFP bitfield types.
+* Board-specific CLKGEN8 setup, PPS routing, and GPIO routing stay outside this HAL.
+* `printf()`, `read()`, `write()`, and other stdio retargeting stay outside this HAL.
+* Application console / command parsing stays outside this HAL.
+* No dynamic memory allocation is used.
+* RX ISR ring buffer storage is caller-provided.
+* Interrupt vector ownership stays outside this HAL.
+* The HAL does not define `_UxRXInterrupt`.
+* In ISR ring mode, the application-owned interrupt vector calls `dspic33ak_uart_rx_irq_handler()`.
+* Public functions are placed near the top of each source file. Static helper functions are placed near the bottom, with only prototypes near the top when needed.
+
+## Clock assumption
+
+This is a **dsPIC33AK CLKGEN8 UART HAL**.
+
+`dspic33ak_uart_init()` selects the UART clock source as CLKGEN8 and uses fractional baud mode. The board/application code must configure and enable CLKGEN8 before calling `dspic33ak_uart_init()`.
+
+The value passed as `config.uart_clk_hz` must be the CLKGEN8 frequency used by the UART baud-rate generator.
+
+The HAL does not configure:
+
+* Clock generator bring-up
+* PPS input/output routing
+* GPIO direction
+* Analog-disable settings
+* Board-level pin selection
 
 ## Public API overview
 
@@ -66,14 +94,59 @@ RX cleanup:
   dspic33ak_uart_rx_flush()
 ```
 
-## Minimal usage example
+RX backend selection is configured per UART instance:
+
+```text
+DSPIC33AK_UART_RX_MODE_POLLING
+  RX is read directly from the hardware RX FIFO.
+  No RX interrupt is enabled.
+
+DSPIC33AK_UART_RX_MODE_ISR_RING
+  RX interrupt drains the hardware RX FIFO into a caller-provided software ring.
+  dspic33ak_uart_rx_ready(), dspic33ak_uart_read_byte(), and
+  dspic33ak_uart_rx_flush() operate on the software ring.
+```
+
+Only these two RX modes are valid. `dspic33ak_uart_init()` rejects other `rx_mode` values with `DSPIC33AK_UART_ERR_INVALID_ARG`.
+
+## Build notes
+
+Add these C files to your project:
+
+```text
+src/dspic33ak_uart.c
+src/dspic33ak_uart_device.c
+src/dspic33ak_uart_rx_isr_ring.c
+```
+
+Add `src/` to your include path.
+
+Application code should normally include only:
 
 ```c
+#include "dspic33ak_uart.h"
+```
+
+If your application defines an RX interrupt vector for ISR ring mode, that vector file should also include:
+
+```c
+#include "dspic33ak_uart_rx_isr_ring.h"
+```
+
+The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally not include it directly.
+
+## Minimal polling example
+
+```c
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
 #include "dspic33ak_uart.h"
 
 static uint32_t app_get_ms(void)
 {
-    /* Return a monotonic millisecond tick, or remove this and set get_ms = NULL. */
+    /* Return a monotonic millisecond tick, or set get_ms = NULL to disable timeout handling. */
     return 0u;
 }
 
@@ -81,17 +154,25 @@ void app_uart_init(void)
 {
     dspic33ak_uart_config_t cfg;
 
-    cfg.uart_clk_hz = 100000000u;
+    memset(&cfg, 0, sizeof(cfg));
+
+    cfg.uart_clk_hz = 100000000u;  /* CLKGEN8 frequency */
     cfg.baudrate    = 115200u;
     cfg.timeout_ms  = 10u;
     cfg.get_ms      = app_get_ms;
+
     cfg.data_bits   = 8u;
     cfg.stop_bits   = 1u;
     cfg.parity      = DSPIC33AK_UART_PARITY_NONE;
+
     cfg.enable_tx   = true;
     cfg.enable_rx   = true;
 
-    /* Board-level PPS / pin / clock setup should be completed before this call. */
+    cfg.rx_mode     = DSPIC33AK_UART_RX_MODE_POLLING;
+
+    /*
+     * Board-level CLKGEN8 / PPS / GPIO setup must be completed before this call.
+     */
     (void)dspic33ak_uart_init(DSPIC33AK_UART_INST_1, &cfg);
 }
 
@@ -105,32 +186,111 @@ void app_uart_poll(void)
 }
 ```
 
-## Build notes
+## Minimal ISR ring example
 
-Add these C files to your project:
+In ISR ring mode, the application provides the RX ring buffer storage and owns the interrupt vector.
 
-```text
-src/dspic33ak_uart.c
-src/dspic33ak_uart_device.c
-src/dspic33ak_uart_ring.c
+```c
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include "dspic33ak_uart.h"
+#include "dspic33ak_uart_rx_isr_ring.h"
+
+static uint8_t uart1_rx_ring[256];
+
+void app_uart_init(void)
+{
+    dspic33ak_uart_config_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+
+    cfg.uart_clk_hz = 100000000u;  /* CLKGEN8 frequency */
+    cfg.baudrate    = 115200u;
+    cfg.timeout_ms  = 10u;
+    cfg.get_ms      = 0;
+
+    cfg.data_bits   = 8u;
+    cfg.stop_bits   = 1u;
+    cfg.parity      = DSPIC33AK_UART_PARITY_NONE;
+
+    cfg.enable_tx   = true;
+    cfg.enable_rx   = true;
+
+    cfg.rx_mode             = DSPIC33AK_UART_RX_MODE_ISR_RING;
+    cfg.rx_ring_buffer      = uart1_rx_ring;
+    cfg.rx_ring_buffer_size = sizeof(uart1_rx_ring);
+    cfg.rx_irq_priority     = 3u;
+
+    /*
+     * Board-level CLKGEN8 / PPS / GPIO setup must be completed before this call.
+     */
+    (void)dspic33ak_uart_init(DSPIC33AK_UART_INST_1, &cfg);
+}
+
+/*
+ * Example interrupt vector wrapper.
+ *
+ * Adjust the interrupt attribute and vector name as needed for your project,
+ * device, and compiler settings.
+ */
+void __attribute__((interrupt, context)) _U1RXInterrupt(void)
+{
+    dspic33ak_uart_rx_irq_handler(DSPIC33AK_UART_INST_1);
+}
 ```
 
-Add `src/` to your include path.
+After initialization, application code can still use the same backend-agnostic RX API:
 
-The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally include only `dspic33ak_uart.h`.
+```c
+uint8_t ch;
+
+if (dspic33ak_uart_read_byte(DSPIC33AK_UART_INST_1, &ch) == DSPIC33AK_UART_OK) {
+    /* ch came from the ISR software ring in ISR ring mode. */
+}
+```
 
 ## Scope and limitations
 
-This repository provides a blocking/polling UART byte-stream HAL. It does not provide a complete board support package.
+This repository provides a UART byte-stream HAL. It does not provide a complete board support package.
+
+Current scope:
+
+* dsPIC33AK UART instances supported by the device header
+* 8 data bits
+* No parity
+* 1 stop bit
+* Blocking TX byte write with optional timeout
+* Non-blocking RX byte read
+* Polling RX backend
+* ISR software-ring RX backend
 
 You still need project-specific code for:
 
-- Peripheral clock routing.
-- PPS input/output routing.
-- GPIO direction / analog-disable setup.
-- stdio retargeting.
-- RX interrupt ring or DMA ownership, if required.
-- Application console or command parser.
+* CLKGEN8 setup
+* PPS input/output routing
+* GPIO direction / analog-disable setup
+* Interrupt vector wrapper
+* stdio retargeting
+* Application console or command parser
+* Device-specific board initialization
+
+## Notes for ISR ring mode
+
+The RX ISR ring backend is included in this repository, but the interrupt vector itself is not.
+
+The application must define the relevant `_UxRXInterrupt` vector and call:
+
+```c
+dspic33ak_uart_rx_irq_handler(DSPIC33AK_UART_INST_1);
+```
+
+from that vector.
+
+The HAL owns the RX FIFO drain logic and software-ring write/read indices. The caller owns the ring buffer memory.
+
+This keeps the HAL reusable while avoiding project-specific interrupt vector ownership inside the driver.
 
 ## License
 

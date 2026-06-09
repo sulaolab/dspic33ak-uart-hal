@@ -49,15 +49,18 @@ typedef struct {
 #define DSPIC33AK_UART_CON_CLKSEL   (1UL << 25)  /* UxCONbits.CLKSEL (pos 0x19) */
 #define DSPIC33AK_UART_CON_CLKMOD   (1UL << 27)  /* UxCONbits.CLKMOD (pos 0x1B) */
 
-/* UxSTAT bits (status used by the byte-stream API) */
+/* UxSTAT bits (status used by the byte-stream API and the RX ISR ring) */
+#define DSPIC33AK_UART_STAT_TXCIF   (1UL << 0)   /* UxSTATbits.TXCIF  (pos 0x00) */
 #define DSPIC33AK_UART_STAT_RXFOIF  (1UL << 1)   /* UxSTATbits.RXFOIF (pos 0x01) */
 #define DSPIC33AK_UART_STAT_FERIF   (1UL << 3)   /* UxSTATbits.FERIF  (pos 0x03) */
+#define DSPIC33AK_UART_STAT_ABDOVIF (1UL << 5)   /* UxSTATbits.ABDOVIF(pos 0x05) */
 #define DSPIC33AK_UART_STAT_PERIF   (1UL << 6)   /* UxSTATbits.PERIF  (pos 0x06) */
 #define DSPIC33AK_UART_STAT_TXMTIF  (1UL << 7)   /* UxSTATbits.TXMTIF (pos 0x07) */
 #define DSPIC33AK_UART_STAT_RXBE    (1UL << 17)  /* UxSTATbits.RXBE   (pos 0x11) */
 #define DSPIC33AK_UART_STAT_TXBF    (1UL << 20)  /* UxSTATbits.TXBF   (pos 0x14) */
 #define DSPIC33AK_UART_STAT_TXBE    (1UL << 21)  /* UxSTATbits.TXBE   (pos 0x15) */
 #define DSPIC33AK_UART_STAT_TXWRE   (1UL << 23)  /* UxSTATbits.TXWRE  (pos 0x17) */
+#define DSPIC33AK_UART_STAT_RXWM    (1UL << 24)  /* UxSTATbits.RXWM   (pos 0x18) */
 
 /* ========================================================================== */
 /* Internal Inline Helpers                                                    */
