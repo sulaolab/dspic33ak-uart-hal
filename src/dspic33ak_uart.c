@@ -2,7 +2,10 @@
 /* Includes                                                                   */
 /* ========================================================================== */
 
+#include <string.h>
+
 #include "dspic33ak_uart.h"
+#include "dspic33ak_uart_rx_isr_ring.h"
 #include "dspic33ak_uart_device.h"
 #include "dspic33ak_uart_reg.h"
 
@@ -13,6 +16,10 @@
 static uint32_t g_timeout_ms[DSPIC33AK_UART_INST_COUNT];
 static dspic33ak_uart_get_ms_fn g_get_ms[DSPIC33AK_UART_INST_COUNT];
 static bool g_initialized[DSPIC33AK_UART_INST_COUNT];
+
+/* Per-instance RX backend (defaults to polling; set from config at init). The
+ * RX query/read/flush API consults this to pick the FIFO or the ISR ring. */
+static dspic33ak_uart_rx_mode_t g_rx_mode[DSPIC33AK_UART_INST_COUNT];
 
 /* ========================================================================== */
 /* Local Function Prototypes                                                  */
@@ -68,6 +75,14 @@ dspic33ak_uart_status_t dspic33ak_uart_init(
         return DSPIC33AK_UART_ERR_UNSUPPORTED;
     }
 
+    /* RX backend must be a known mode. Reject unknown/uninitialized rx_mode here,
+     * before touching any register, so a bad config never silently falls through
+     * to polling and never leaves the UART peripheral half-configured. */
+    if ((config->rx_mode != DSPIC33AK_UART_RX_MODE_POLLING) &&
+        (config->rx_mode != DSPIC33AK_UART_RX_MODE_ISR_RING)) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+
     st = uart_get_regs(inst, &r);
     if (st != DSPIC33AK_UART_OK) {
         return st;
@@ -82,7 +97,10 @@ dspic33ak_uart_status_t dspic33ak_uart_init(
     *r->CON = 0u;
     *r->STAT = 0u;
 
-    /* Clock: select CLKGEN8 and fractional baud mode (BRGS stays 0). */
+    /* Clock: select CLKGEN8 (CLKSEL) and fractional baud mode (CLKMOD; BRGS stays
+     * 0). This HAL assumes CLKGEN8 as the UART clock source; the board/application
+     * must have brought CLKGEN8 up before init, and config.uart_clk_hz must be the
+     * CLKGEN8 frequency used for the baud-divisor calculation. */
     dspic33ak_uart_reg_set(r->CON, DSPIC33AK_UART_CON_CLKSEL);
     dspic33ak_uart_reg_set(r->CON, DSPIC33AK_UART_CON_CLKMOD);
 
@@ -104,6 +122,33 @@ dspic33ak_uart_status_t dspic33ak_uart_init(
     g_timeout_ms[inst] = config->timeout_ms;
     g_get_ms[inst] = config->get_ms;
     g_initialized[inst] = true;
+    g_rx_mode[inst] = config->rx_mode;
+
+    /*
+     * RX backend setup. ISR ring mode configures and enables the interrupt-driven
+     * RX ring now. dspic33ak_uart_rx_isr_config() requires the instance to be
+     * initialized, so this runs after g_initialized = true. On failure, unwind via
+     * deinit so a half-initialized instance is never left behind.
+     */
+    if (config->rx_mode == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        dspic33ak_uart_rx_isr_config_t rx_cfg;
+
+        rx_cfg.buffer       = config->rx_ring_buffer;
+        rx_cfg.buffer_size  = config->rx_ring_buffer_size;
+        rx_cfg.irq_priority = config->rx_irq_priority;
+
+        st = dspic33ak_uart_rx_isr_config(inst, &rx_cfg);
+        if (st != DSPIC33AK_UART_OK) {
+            (void)dspic33ak_uart_deinit(inst);
+            return st;
+        }
+
+        st = dspic33ak_uart_rx_isr_enable(inst);
+        if (st != DSPIC33AK_UART_OK) {
+            (void)dspic33ak_uart_deinit(inst);
+            return st;
+        }
+    }
 
     return DSPIC33AK_UART_OK;
 }
@@ -126,6 +171,12 @@ dspic33ak_uart_status_t dspic33ak_uart_deinit(
         return st;
     }
 
+    /* Stop the RX ISR first (if this instance ran the ring) so it cannot touch
+     * the FIFO mid-teardown. Safe/no-op in polling mode. */
+    if (g_rx_mode[inst] == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        (void)dspic33ak_uart_rx_isr_disable(inst);
+    }
+
     dspic33ak_uart_reg_clear(r->CON,
                              DSPIC33AK_UART_CON_TXEN |
                              DSPIC33AK_UART_CON_RXEN |
@@ -134,6 +185,7 @@ dspic33ak_uart_status_t dspic33ak_uart_deinit(
     g_timeout_ms[inst] = 0u;
     g_get_ms[inst] = 0;
     g_initialized[inst] = false;
+    g_rx_mode[inst] = DSPIC33AK_UART_RX_MODE_POLLING;
 
     return DSPIC33AK_UART_OK;
 }
@@ -169,7 +221,12 @@ bool dspic33ak_uart_rx_ready(dspic33ak_uart_instance_t inst)
         return false;
     }
 
-    /* RX has data when the RX buffer is NOT empty. */
+    /* ISR ring backend: readiness reflects buffered ring contents. */
+    if (g_rx_mode[inst] == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        return dspic33ak_uart_rx_isr_ready(inst);
+    }
+
+    /* Polling backend: RX has data when the RX FIFO is NOT empty. */
     return !dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXBE);
 }
 
@@ -249,6 +306,12 @@ dspic33ak_uart_status_t dspic33ak_uart_read_byte(
         return st;
     }
 
+    /* ISR ring backend: pop from the software ring (the ISR owns the FIFO). */
+    if (g_rx_mode[inst] == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        return dspic33ak_uart_rx_isr_read_byte(inst, data);
+    }
+
+    /* Polling backend: read directly from the RX FIFO. */
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXBE)) {
         return DSPIC33AK_UART_ERR_RX_EMPTY;
     }
@@ -324,6 +387,13 @@ void dspic33ak_uart_rx_flush(dspic33ak_uart_instance_t inst)
         return;
     }
 
+    /* ISR ring backend: flush the ring (it also drains the hardware FIFO). */
+    if (g_rx_mode[inst] == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        dspic33ak_uart_rx_isr_flush(inst);
+        return;
+    }
+
+    /* Polling backend: drain the hardware RX FIFO and clear the overflow flag. */
     while (!dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXBE)) {
         (void)(*r->RXB);
     }
@@ -331,6 +401,69 @@ void dspic33ak_uart_rx_flush(dspic33ak_uart_instance_t inst)
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXFOIF)) {
         dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_RXFOIF);
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_status_get                                               */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_status_get(
+    dspic33ak_uart_instance_t inst,
+    dspic33ak_uart_rx_status_t *status)
+{
+    dspic33ak_uart_status_t st;
+
+    if (status == 0) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    memset(status, 0, sizeof(*status));
+    status->rx_mode = g_rx_mode[inst];
+
+    /* ISR ring backend: copy the ring counters. Polling backend keeps no
+     * counters, so the zeroed snapshot above is the result. */
+    if (g_rx_mode[inst] == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        dspic33ak_uart_rx_isr_status_t isr_status;
+
+        dspic33ak_uart_rx_isr_status_get(inst, &isr_status);
+
+        status->rx_isr_count            = isr_status.rx_isr_count;
+        status->rx_byte_count           = isr_status.rx_byte_count;
+        status->rx_fifo_overflow_count  = isr_status.rx_fifo_overflow_count;
+        status->framing_error_count     = isr_status.framing_error_count;
+        status->parity_error_count      = isr_status.parity_error_count;
+        status->autobaud_overflow_count = isr_status.autobaud_overflow_count;
+        status->tx_collision_count      = isr_status.tx_collision_count;
+        status->rx_ring_overflow_count  = isr_status.rx_ring_overflow_count;
+        status->rx_max_drain_count      = isr_status.rx_max_drain_count;
+    }
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_status_clear                                             */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_status_clear(
+    dspic33ak_uart_instance_t inst)
+{
+    dspic33ak_uart_status_t st;
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    /* ISR ring backend: clear the ring counters. Polling backend has none. */
+    if (g_rx_mode[inst] == DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        dspic33ak_uart_rx_isr_status_clear(inst);
+    }
+
+    return DSPIC33AK_UART_OK;
 }
 
 /* ========================================================================== */

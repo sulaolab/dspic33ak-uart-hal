@@ -1,0 +1,490 @@
+/* ========================================================================== */
+/* Includes                                                                   */
+/* ========================================================================== */
+
+#include <xc.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "dspic33ak_uart_rx_isr_ring.h"
+#include "dspic33ak_uart_device.h"
+#include "dspic33ak_uart_reg.h"
+
+/* ========================================================================== */
+/* Module Overview                                                            */
+/* ========================================================================== */
+
+/*
+ * UART RX interrupt-driven ring HAL - implementation.
+ *
+ * The RX FIFO -> software-ring drain logic, the RX error-flag accounting, and
+ * the RX ISR ring runtime status counters live here. The ring buffer storage is
+ * caller-provided; this module only keeps a pointer to it plus the read/write
+ * indices.
+ *
+ * Register access goes through the device register-pointer table
+ * (dspic33ak_uart_get_device) and the dspic33ak_uart_reg.h bit-mask helpers, so
+ * no UxSTATbits / UxRXB symbol names appear here. The only device-specific
+ * symbols are the scattered RX interrupt bits (_UxRXIF/IE/IP), isolated in the
+ * small per-instance switch helpers below; cases for UART2/3/4 are guarded by
+ * _U2RXIF / _U3RXIF / _U4RXIF so the file builds on devices that lack them.
+ *
+ * No printf / halt / blocking calls and no application dependencies. The
+ * _UxRXInterrupt vector is NOT defined here; the application owns the vector and
+ * calls dspic33ak_uart_rx_irq_handler() from it.
+ */
+
+/* ========================================================================== */
+/* Module Variables                                                           */
+/* ========================================================================== */
+
+/*
+ * Single-producer (ISR) / single-consumer (reader) ring, per instance.
+ *   - g_rx_write_idx is advanced only by dspic33ak_uart_rx_irq_handler().
+ *   - g_rx_read_idx is advanced only by dspic33ak_uart_rx_isr_read_byte().
+ * The buffer itself is owned by the caller (passed in via config).
+ */
+static uint8_t *g_rx_ring[DSPIC33AK_UART_INST_COUNT];
+static uint16_t g_rx_ring_size[DSPIC33AK_UART_INST_COUNT];
+static volatile uint16_t g_rx_read_idx[DSPIC33AK_UART_INST_COUNT];
+static volatile uint16_t g_rx_write_idx[DSPIC33AK_UART_INST_COUNT];
+static volatile dspic33ak_uart_rx_isr_status_t g_rx_status[DSPIC33AK_UART_INST_COUNT];
+static bool g_rx_isr_configured[DSPIC33AK_UART_INST_COUNT];
+
+/* ========================================================================== */
+/* Local Function Prototypes                                                  */
+/* ========================================================================== */
+
+static bool uart_inst_is_valid(dspic33ak_uart_instance_t inst);
+static const dspic33ak_uart_regs_t *uart_regs(dspic33ak_uart_instance_t inst);
+
+static bool uart_rx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t prio);
+static bool uart_rx_irq_clear_flag(dspic33ak_uart_instance_t inst);
+static bool uart_rx_irq_enable(dspic33ak_uart_instance_t inst, bool enable);
+static uint8_t uart_rx_irq_get_enable(dspic33ak_uart_instance_t inst);
+
+static void uart_rx_ring_push(dspic33ak_uart_instance_t inst, uint8_t b);
+
+/* ========================================================================== */
+/* Public Functions                                                           */
+/* ========================================================================== */
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_config                                               */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_isr_config(
+    dspic33ak_uart_instance_t inst,
+    const dspic33ak_uart_rx_isr_config_t *config)
+{
+    const dspic33ak_uart_regs_t *r;
+
+    if (!uart_inst_is_valid(inst)) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    if (config == NULL || config->buffer == NULL || config->buffer_size < 2u) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+
+    r = uart_regs(inst);
+    if (r == NULL) {
+        return DSPIC33AK_UART_ERR_NOT_PRESENT;
+    }
+    if (!dspic33ak_uart_is_initialized(inst)) {
+        return DSPIC33AK_UART_ERR_NOT_INITIALIZED;
+    }
+
+    /* Reject instances with no RX interrupt mapping before changing any state. */
+    if (!uart_rx_irq_set_priority(inst, config->irq_priority)) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+
+    /* Bind the caller's buffer and reset ring + status counters. */
+    g_rx_ring[inst]      = config->buffer;
+    g_rx_ring_size[inst] = config->buffer_size;
+    g_rx_read_idx[inst]  = 0u;
+    g_rx_write_idx[inst] = 0u;
+    memset(config->buffer, 0x00, config->buffer_size);
+    memset((void *)&g_rx_status[inst], 0x00, sizeof(g_rx_status[inst]));
+
+    /* Interrupt when >= 1 char is in the RX FIFO (RXWM = 0). */
+    dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_RXWM);
+
+    /* Priority already set above; clear any stale flag, leave disabled. */
+    (void)uart_rx_irq_clear_flag(inst);
+
+    g_rx_isr_configured[inst] = true;
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_enable                                               */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_isr_enable(
+    dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    if (!g_rx_isr_configured[inst]) {
+        /* No "not configured" status code exists; the ring is unusable until
+         * dspic33ak_uart_rx_isr_config() succeeds, so report not-initialized. */
+        return DSPIC33AK_UART_ERR_NOT_INITIALIZED;
+    }
+    if (!dspic33ak_uart_is_initialized(inst)) {
+        return DSPIC33AK_UART_ERR_NOT_INITIALIZED;
+    }
+
+    (void)uart_rx_irq_clear_flag(inst);
+    if (!uart_rx_irq_enable(inst, true)) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_disable                                              */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_isr_disable(
+    dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+
+    /* Disable is the safe direction: allowed even when not configured. */
+    if (!uart_rx_irq_enable(inst, false)) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    (void)uart_rx_irq_clear_flag(inst);
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_ready                                                */
+/* -------------------------------------------------------------------------- */
+bool dspic33ak_uart_rx_isr_ready(dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst) || !g_rx_isr_configured[inst]) {
+        return false;
+    }
+
+    return (g_rx_read_idx[inst] != g_rx_write_idx[inst]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_read_byte                                            */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_isr_read_byte(
+    dspic33ak_uart_instance_t inst,
+    uint8_t *data)
+{
+    uint16_t read_idx;
+    uint16_t next;
+
+    if (data == NULL) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    if (!uart_inst_is_valid(inst) || !g_rx_isr_configured[inst]) {
+        return DSPIC33AK_UART_ERR_RX_EMPTY;
+    }
+    if (g_rx_read_idx[inst] == g_rx_write_idx[inst]) {
+        return DSPIC33AK_UART_ERR_RX_EMPTY;
+    }
+
+    read_idx = g_rx_read_idx[inst];
+    *data = g_rx_ring[inst][read_idx];
+
+    next = (uint16_t)(read_idx + 1u);
+    if (next >= g_rx_ring_size[inst]) {
+        next = 0u;
+    }
+    g_rx_read_idx[inst] = next;
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_flush                                                */
+/* -------------------------------------------------------------------------- */
+void dspic33ak_uart_rx_isr_flush(dspic33ak_uart_instance_t inst)
+{
+    const dspic33ak_uart_regs_t *r;
+    uint8_t ie;
+
+    if (!uart_inst_is_valid(inst)) {
+        return;
+    }
+    r = uart_regs(inst);
+    if (r == NULL) {
+        return;
+    }
+
+    ie = uart_rx_irq_get_enable(inst);
+    (void)uart_rx_irq_enable(inst, false);   /* brief critical section vs the ISR */
+
+    g_rx_read_idx[inst] = g_rx_write_idx[inst];   /* drop buffered ring contents */
+
+    while (!dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXBE)) {
+        (void)(*r->RXB);                      /* drain the hardware RX FIFO too */
+    }
+    if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXFOIF)) {
+        dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_RXFOIF);
+    }
+
+    (void)uart_rx_irq_enable(inst, (ie != 0u));
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_status_get                                           */
+/* -------------------------------------------------------------------------- */
+void dspic33ak_uart_rx_isr_status_get(
+    dspic33ak_uart_instance_t inst,
+    dspic33ak_uart_rx_isr_status_t *status)
+{
+    uint8_t ie;
+
+    if (status == NULL || !uart_inst_is_valid(inst)) {
+        return;
+    }
+
+    ie = uart_rx_irq_get_enable(inst);
+    (void)uart_rx_irq_enable(inst, false);   /* atomic snapshot vs the ISR */
+
+    status->rx_isr_count            = g_rx_status[inst].rx_isr_count;
+    status->rx_byte_count           = g_rx_status[inst].rx_byte_count;
+    status->rx_fifo_overflow_count  = g_rx_status[inst].rx_fifo_overflow_count;
+    status->framing_error_count     = g_rx_status[inst].framing_error_count;
+    status->parity_error_count      = g_rx_status[inst].parity_error_count;
+    status->autobaud_overflow_count = g_rx_status[inst].autobaud_overflow_count;
+    status->tx_collision_count      = g_rx_status[inst].tx_collision_count;
+    status->rx_ring_overflow_count  = g_rx_status[inst].rx_ring_overflow_count;
+    status->rx_max_drain_count      = g_rx_status[inst].rx_max_drain_count;
+
+    (void)uart_rx_irq_enable(inst, (ie != 0u));
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_isr_status_clear                                         */
+/* -------------------------------------------------------------------------- */
+void dspic33ak_uart_rx_isr_status_clear(dspic33ak_uart_instance_t inst)
+{
+    uint8_t ie;
+
+    if (!uart_inst_is_valid(inst)) {
+        return;
+    }
+
+    ie = uart_rx_irq_get_enable(inst);
+    (void)uart_rx_irq_enable(inst, false);
+    memset((void *)&g_rx_status[inst], 0x00, sizeof(g_rx_status[inst]));
+    (void)uart_rx_irq_enable(inst, (ie != 0u));
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_irq_handler                                              */
+/* -------------------------------------------------------------------------- */
+void dspic33ak_uart_rx_irq_handler(dspic33ak_uart_instance_t inst)
+{
+    const dspic33ak_uart_regs_t *r;
+    uint16_t drain_count = 0u;
+
+    if (!uart_inst_is_valid(inst)) {
+        return;
+    }
+    r = uart_regs(inst);
+    if (r == NULL) {
+        return;
+    }
+
+    (void)uart_rx_irq_clear_flag(inst);   /* clear RX interrupt flag first */
+    g_rx_status[inst].rx_isr_count++;
+
+    /* Drain all available bytes from the RX FIFO (reading RXB advances it). */
+    while (!dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXBE)) {
+        uart_rx_ring_push(inst, (uint8_t)(*r->RXB));
+        drain_count++;
+    }
+
+    g_rx_status[inst].rx_byte_count += drain_count;
+    if (drain_count > g_rx_status[inst].rx_max_drain_count) {
+        g_rx_status[inst].rx_max_drain_count = drain_count;
+    }
+
+    /* Count and clear the latched RX error flags. */
+    if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXFOIF)) {
+        g_rx_status[inst].rx_fifo_overflow_count++;
+        dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_RXFOIF);
+    }
+    if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_FERIF)) {
+        g_rx_status[inst].framing_error_count++;
+        dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_FERIF);
+    }
+    if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_PERIF)) {
+        g_rx_status[inst].parity_error_count++;
+        dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_PERIF);
+    }
+    if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_ABDOVIF)) {
+        g_rx_status[inst].autobaud_overflow_count++;
+        dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_ABDOVIF);
+    }
+    if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_TXCIF)) {
+        g_rx_status[inst].tx_collision_count++;
+        dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_TXCIF);
+    }
+}
+
+/* ========================================================================== */
+/* Local Functions                                                            */
+/* ========================================================================== */
+
+/* -------------------------------------------------------------------------- */
+/* uart_inst_is_valid                                                         */
+/* -------------------------------------------------------------------------- */
+static bool uart_inst_is_valid(dspic33ak_uart_instance_t inst)
+{
+    return ((unsigned)inst < (unsigned)DSPIC33AK_UART_INST_COUNT);
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_regs                                                                  */
+/* -------------------------------------------------------------------------- */
+static const dspic33ak_uart_regs_t *uart_regs(dspic33ak_uart_instance_t inst)
+{
+    const dspic33ak_uart_device_t *dev = dspic33ak_uart_get_device(inst);
+
+    if (dev == NULL) {
+        return NULL;
+    }
+    return &dev->regs;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_ring_push                                                          */
+/*                                                                            */
+/* Single-producer push (ISR context). If the next write slot would collide   */
+/* with the read index, the byte is dropped and rx_ring_overflow_count is      */
+/* incremented (safer than advancing the write index unconditionally).        */
+/* -------------------------------------------------------------------------- */
+static void uart_rx_ring_push(dspic33ak_uart_instance_t inst, uint8_t b)
+{
+    uint16_t write_idx = g_rx_write_idx[inst];
+    uint16_t next = (uint16_t)(write_idx + 1u);
+
+    if (next >= g_rx_ring_size[inst]) {
+        next = 0u;
+    }
+
+    if (next == g_rx_read_idx[inst]) {
+        g_rx_status[inst].rx_ring_overflow_count++;
+        return;
+    }
+
+    g_rx_ring[inst][write_idx] = b;
+    g_rx_write_idx[inst] = next;
+}
+
+/* ========================================================================== */
+/* Local Functions: RX interrupt Flag / Enable / Priority                     */
+/*                                                                            */
+/* The RX interrupt bits live in scattered CPU registers and do not index by   */
+/* instance, so the per-instance mapping is isolated here. Each helper returns  */
+/* false when the instance has no RX interrupt mapping on this device (UART2/3/ */
+/* 4 cases are compiled in only when the corresponding _UxRXIF macro exists).   */
+/* ========================================================================== */
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_irq_set_priority                                                   */
+/* -------------------------------------------------------------------------- */
+static bool uart_rx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t prio)
+{
+    switch (inst) {
+#if defined(_U1RXIF)
+    case DSPIC33AK_UART_INST_1: _U1RXIP = prio; return true;
+#endif
+#if defined(_U2RXIF)
+    case DSPIC33AK_UART_INST_2: _U2RXIP = prio; return true;
+#endif
+#if defined(_U3RXIF)
+    case DSPIC33AK_UART_INST_3: _U3RXIP = prio; return true;
+#endif
+#if defined(_U4RXIF)
+    case DSPIC33AK_UART_INST_4: _U4RXIP = prio; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_irq_clear_flag                                                      */
+/* -------------------------------------------------------------------------- */
+static bool uart_rx_irq_clear_flag(dspic33ak_uart_instance_t inst)
+{
+    switch (inst) {
+#if defined(_U1RXIF)
+    case DSPIC33AK_UART_INST_1: _U1RXIF = 0; return true;
+#endif
+#if defined(_U2RXIF)
+    case DSPIC33AK_UART_INST_2: _U2RXIF = 0; return true;
+#endif
+#if defined(_U3RXIF)
+    case DSPIC33AK_UART_INST_3: _U3RXIF = 0; return true;
+#endif
+#if defined(_U4RXIF)
+    case DSPIC33AK_UART_INST_4: _U4RXIF = 0; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_irq_enable                                                         */
+/* -------------------------------------------------------------------------- */
+static bool uart_rx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
+{
+    const uint8_t v = enable ? 1u : 0u;
+
+    switch (inst) {
+#if defined(_U1RXIF)
+    case DSPIC33AK_UART_INST_1: _U1RXIE = v; return true;
+#endif
+#if defined(_U2RXIF)
+    case DSPIC33AK_UART_INST_2: _U2RXIE = v; return true;
+#endif
+#if defined(_U3RXIF)
+    case DSPIC33AK_UART_INST_3: _U3RXIE = v; return true;
+#endif
+#if defined(_U4RXIF)
+    case DSPIC33AK_UART_INST_4: _U4RXIE = v; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_irq_get_enable                                                      */
+/* -------------------------------------------------------------------------- */
+static uint8_t uart_rx_irq_get_enable(dspic33ak_uart_instance_t inst)
+{
+    switch (inst) {
+#if defined(_U1RXIF)
+    case DSPIC33AK_UART_INST_1: return (uint8_t)_U1RXIE;
+#endif
+#if defined(_U2RXIF)
+    case DSPIC33AK_UART_INST_2: return (uint8_t)_U2RXIE;
+#endif
+#if defined(_U3RXIF)
+    case DSPIC33AK_UART_INST_3: return (uint8_t)_U3RXIE;
+#endif
+#if defined(_U4RXIF)
+    case DSPIC33AK_UART_INST_4: return (uint8_t)_U4RXIE;
+#endif
+    default: break;
+    }
+    return 0u;
+}
