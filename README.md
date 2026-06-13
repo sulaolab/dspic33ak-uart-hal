@@ -17,6 +17,9 @@ This version supports:
 * Caller-provided RX ring buffer storage
 * dsPIC33AK UART clock source through CLKGEN8
 * 8N1 byte-stream operation
+* Optional asynchronous (non-blocking) TX/RX transfer model with completion and
+  error events through a registered callback (additive; the byte-stream API and
+  RX ISR ring keep working unchanged)
 
 ## Repository layout
 
@@ -133,7 +136,9 @@ If your application defines an RX interrupt vector for ISR ring mode, that vecto
 #include "dspic33ak_uart_rx_isr_ring.h"
 ```
 
-The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally not include it directly.
+The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally not include it directly. (The asynchronous engine's internal hooks are declared in `dspic33ak_uart_rx_isr_ring.h`; they are likewise not for application use.)
+
+If your application uses the asynchronous transfer model and starts TX transfers (`dspic33ak_uart_tx_start()`), the application-owned `_UxTXInterrupt` vector must call `dspic33ak_uart_tx_irq_handler()`, the same way the RX vector calls `dspic33ak_uart_rx_irq_handler()`.
 
 ## Minimal polling example
 

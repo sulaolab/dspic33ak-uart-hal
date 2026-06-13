@@ -153,6 +153,36 @@ void dspic33ak_uart_rx_irq_handler(
     dspic33ak_uart_instance_t inst);
 
 /* ========================================================================== */
+/* Internal HAL hooks                                                         */
+/*                                                                            */
+/* Glue between the RX ISR ring core (dspic33ak_uart_rx_isr_ring.c) and the    */
+/* asynchronous transfer engine and its callback state (dspic33ak_uart.c).     */
+/* The RX ISR handler above calls these; they are implemented in               */
+/* dspic33ak_uart.c. Not part of the application-facing API.                   */
+/* ========================================================================== */
+
+/*
+ * Internal HAL hook. Do NOT call from application code.
+ *
+ * Offer one freshly received byte to an active async RX transfer. Returns true
+ * when the byte was consumed by the transfer (and the caller must NOT also push
+ * it to the RX ISR ring); returns false when no async RX transfer is active.
+ * Reports DSPIC33AK_UART_EVENT_RX_COMPLETE when the requested length is reached.
+ */
+bool dspic33ak_uart_async_rx_feed(
+    dspic33ak_uart_instance_t inst,
+    uint8_t byte);
+
+/*
+ * Internal HAL hook. Do NOT call from application code.
+ *
+ * Forward RX-side event bits (errors / RX_READY) to the registered callback.
+ */
+void dspic33ak_uart_async_notify_events(
+    dspic33ak_uart_instance_t inst,
+    uint32_t events);
+
+/* ========================================================================== */
 /* C++ Linkage                                                                */
 /* ========================================================================== */
 

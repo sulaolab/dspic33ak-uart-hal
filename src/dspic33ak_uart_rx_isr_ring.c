@@ -290,6 +290,9 @@ void dspic33ak_uart_rx_irq_handler(dspic33ak_uart_instance_t inst)
 {
     const dspic33ak_uart_regs_t *r;
     uint16_t drain_count = 0u;
+    uint32_t events = 0u;            /* async event bits to report after drain  */
+    uint32_t ring_overflow_before;  /* ring-overflow counter snapshot          */
+    bool ring_got_data = false;     /* at least one byte routed to the ring     */
 
     if (!uart_inst_is_valid(inst)) {
         return;
@@ -301,10 +304,21 @@ void dspic33ak_uart_rx_irq_handler(dspic33ak_uart_instance_t inst)
 
     (void)uart_rx_irq_clear_flag(inst);   /* clear RX interrupt flag first */
     g_rx_status[inst].rx_isr_count++;
+    ring_overflow_before = g_rx_status[inst].rx_ring_overflow_count;
 
-    /* Drain all available bytes from the RX FIFO (reading RXB advances it). */
+    /*
+     * Drain all available bytes from the RX FIFO (reading RXB advances it). An
+     * active async RX transfer takes priority: each byte is offered to it first
+     * and only pushed to the software ring when no transfer is consuming bytes.
+     * This keeps the existing byte-stream ring behavior intact when no async
+     * Receive is in progress.
+     */
     while (!dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXBE)) {
-        uart_rx_ring_push(inst, (uint8_t)(*r->RXB));
+        uint8_t b = (uint8_t)(*r->RXB);
+        if (!dspic33ak_uart_async_rx_feed(inst, b)) {
+            uart_rx_ring_push(inst, b);
+            ring_got_data = true;
+        }
         drain_count++;
     }
 
@@ -313,18 +327,22 @@ void dspic33ak_uart_rx_irq_handler(dspic33ak_uart_instance_t inst)
         g_rx_status[inst].rx_max_drain_count = drain_count;
     }
 
-    /* Count and clear the latched RX error flags. */
+    /* Count and clear the latched RX error flags, collecting the generic async
+     * event bits for the ones the async layer exposes. */
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_RXFOIF)) {
         g_rx_status[inst].rx_fifo_overflow_count++;
         dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_RXFOIF);
+        events |= DSPIC33AK_UART_EVENT_RX_OVERRUN_ERROR;
     }
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_FERIF)) {
         g_rx_status[inst].framing_error_count++;
         dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_FERIF);
+        events |= DSPIC33AK_UART_EVENT_RX_FRAMING_ERROR;
     }
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_PERIF)) {
         g_rx_status[inst].parity_error_count++;
         dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_PERIF);
+        events |= DSPIC33AK_UART_EVENT_RX_PARITY_ERROR;
     }
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_ABDOVIF)) {
         g_rx_status[inst].autobaud_overflow_count++;
@@ -333,6 +351,20 @@ void dspic33ak_uart_rx_irq_handler(dspic33ak_uart_instance_t inst)
     if (dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_TXCIF)) {
         g_rx_status[inst].tx_collision_count++;
         dspic33ak_uart_reg_clear(r->STAT, DSPIC33AK_UART_STAT_TXCIF);
+    }
+
+    /* Software ring overflow (a byte was dropped during the drain above). */
+    if (g_rx_status[inst].rx_ring_overflow_count != ring_overflow_before) {
+        events |= DSPIC33AK_UART_EVENT_RX_OVERFLOW;
+    }
+
+    /* Unsolicited byte-stream data landed in the ring this pass. */
+    if (ring_got_data) {
+        events |= DSPIC33AK_UART_EVENT_RX_READY;
+    }
+
+    if (events != 0u) {
+        dspic33ak_uart_async_notify_events(inst, events);
     }
 }
 
