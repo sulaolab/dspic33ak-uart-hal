@@ -2,6 +2,7 @@
 /* Includes                                                                   */
 /* ========================================================================== */
 
+#include <xc.h>          /* TX interrupt Flag/Enable/Priority bits (async TX) */
 #include <string.h>
 
 #include "dspic33ak_uart.h"
@@ -20,6 +21,34 @@ static bool g_initialized[DSPIC33AK_UART_INST_COUNT];
 /* Per-instance RX backend (defaults to polling; set from config at init). The
  * RX query/read/flush API consults this to pick the FIFO or the ISR ring. */
 static dspic33ak_uart_rx_mode_t g_rx_mode[DSPIC33AK_UART_INST_COUNT];
+
+/* ---- Asynchronous transfer model state (per instance) -------------------- *
+ * All of this is inert until dspic33ak_uart_tx_start()/_rx_start() is used, so
+ * it does not affect the byte-stream API or the RX ISR ring.
+ *
+ * Sharing with interrupt context: the TX ISR updates g_tx_count/g_tx_busy and
+ * the RX ISR updates g_rx_count/g_rx_busy, so only those counters and flags are
+ * volatile. The buffer pointer and length are written once (before the busy
+ * flag is set and the interrupt is enabled) and only read afterwards, so they
+ * do not need to be volatile. */
+static dspic33ak_uart_event_callback_t g_callback[DSPIC33AK_UART_INST_COUNT];
+static void *g_callback_user_data[DSPIC33AK_UART_INST_COUNT];
+
+static uint32_t g_uart_clk_hz[DSPIC33AK_UART_INST_COUNT];
+static uint32_t g_baudrate[DSPIC33AK_UART_INST_COUNT];
+static bool     g_tx_enabled[DSPIC33AK_UART_INST_COUNT];
+static bool     g_rx_enabled[DSPIC33AK_UART_INST_COUNT];
+static uint8_t  g_tx_irq_priority[DSPIC33AK_UART_INST_COUNT];
+
+static const uint8_t   *g_tx_buf[DSPIC33AK_UART_INST_COUNT];
+static size_t           g_tx_len[DSPIC33AK_UART_INST_COUNT];
+static volatile size_t  g_tx_count[DSPIC33AK_UART_INST_COUNT];
+static volatile bool    g_tx_busy[DSPIC33AK_UART_INST_COUNT];
+
+static uint8_t         *g_rx_buf[DSPIC33AK_UART_INST_COUNT];
+static size_t           g_rx_len[DSPIC33AK_UART_INST_COUNT];
+static volatile size_t  g_rx_count[DSPIC33AK_UART_INST_COUNT];
+static volatile bool    g_rx_busy[DSPIC33AK_UART_INST_COUNT];
 
 /* ========================================================================== */
 /* Local Function Prototypes                                                  */
@@ -44,6 +73,14 @@ static uint32_t uart_timeout_start_ms(
 static bool uart_timeout_expired(
     dspic33ak_uart_instance_t inst,
     uint32_t start_ms);
+
+static void uart_async_reset(dspic33ak_uart_instance_t inst);
+static void uart_notify(dspic33ak_uart_instance_t inst, uint32_t events);
+
+static bool uart_tx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t prio);
+static bool uart_tx_irq_clear_flag(dspic33ak_uart_instance_t inst);
+static bool uart_tx_irq_raise_flag(dspic33ak_uart_instance_t inst);
+static bool uart_tx_irq_enable(dspic33ak_uart_instance_t inst, bool enable);
 
 /* ========================================================================== */
 /* Public Functions                                                           */
@@ -124,6 +161,22 @@ dspic33ak_uart_status_t dspic33ak_uart_init(
     g_initialized[inst] = true;
     g_rx_mode[inst] = config->rx_mode;
 
+    /* Async transfer model context: remember clock/baud and the TX/RX enable
+     * state, start with a cleared callback and no active transfer, and program
+     * the (disabled) TX interrupt priority for the async TX engine. */
+    g_uart_clk_hz[inst]     = config->uart_clk_hz;
+    g_baudrate[inst]        = config->baudrate;
+    g_tx_enabled[inst]      = config->enable_tx;
+    g_rx_enabled[inst]      = config->enable_rx;
+    g_tx_irq_priority[inst] = config->tx_irq_priority;
+    g_callback[inst]           = 0;
+    g_callback_user_data[inst] = 0;
+    uart_async_reset(inst);
+
+    (void)uart_tx_irq_enable(inst, false);
+    (void)uart_tx_irq_clear_flag(inst);
+    (void)uart_tx_irq_set_priority(inst, config->tx_irq_priority);
+
     /*
      * RX backend setup. ISR ring mode configures and enables the interrupt-driven
      * RX ring now. dspic33ak_uart_rx_isr_config() requires the instance to be
@@ -177,6 +230,10 @@ dspic33ak_uart_status_t dspic33ak_uart_deinit(
         (void)dspic33ak_uart_rx_isr_disable(inst);
     }
 
+    /* Stop the async TX engine too (no-op if it was never used). */
+    (void)uart_tx_irq_enable(inst, false);
+    (void)uart_tx_irq_clear_flag(inst);
+
     dspic33ak_uart_reg_clear(r->CON,
                              DSPIC33AK_UART_CON_TXEN |
                              DSPIC33AK_UART_CON_RXEN |
@@ -186,6 +243,16 @@ dspic33ak_uart_status_t dspic33ak_uart_deinit(
     g_get_ms[inst] = 0;
     g_initialized[inst] = false;
     g_rx_mode[inst] = DSPIC33AK_UART_RX_MODE_POLLING;
+
+    /* Drop async transfer model state. */
+    g_uart_clk_hz[inst]        = 0u;
+    g_baudrate[inst]           = 0u;
+    g_tx_enabled[inst]         = false;
+    g_rx_enabled[inst]         = false;
+    g_tx_irq_priority[inst]    = 0u;
+    g_callback[inst]           = 0;
+    g_callback_user_data[inst] = 0;
+    uart_async_reset(inst);
 
     return DSPIC33AK_UART_OK;
 }
@@ -467,6 +534,403 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_status_clear(
 }
 
 /* ========================================================================== */
+/* Public Functions: Asynchronous Transfer Model                              */
+/* ========================================================================== */
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_set_callback                                                */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_set_callback(
+    dspic33ak_uart_instance_t inst,
+    dspic33ak_uart_event_callback_t callback,
+    void *user_data)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    if (!dspic33ak_uart_instance_is_present(inst)) {
+        return DSPIC33AK_UART_ERR_NOT_PRESENT;
+    }
+
+    g_callback[inst]           = callback;
+    g_callback_user_data[inst] = user_data;
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_enable                                                   */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_tx_enable(
+    dspic33ak_uart_instance_t inst,
+    bool enable)
+{
+    const dspic33ak_uart_regs_t *r;
+    dspic33ak_uart_status_t st;
+
+    st = uart_require_initialized(inst, &r);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    /* Disabling TX under an active async transfer would strand it (no
+     * SEND_COMPLETE); reject until the transfer finishes or is aborted. */
+    if (!enable && g_tx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+
+    if (enable) {
+        dspic33ak_uart_reg_set(r->CON, DSPIC33AK_UART_CON_TXEN);
+    } else {
+        dspic33ak_uart_reg_clear(r->CON, DSPIC33AK_UART_CON_TXEN);
+    }
+    g_tx_enabled[inst] = enable;
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_enable                                                   */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_enable(
+    dspic33ak_uart_instance_t inst,
+    bool enable)
+{
+    const dspic33ak_uart_regs_t *r;
+    dspic33ak_uart_status_t st;
+
+    st = uart_require_initialized(inst, &r);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    /* Disabling RX under an active async transfer would strand it (no
+     * RX_COMPLETE); reject until the transfer finishes or is aborted. */
+    if (!enable && g_rx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+
+    if (enable) {
+        dspic33ak_uart_reg_set(r->CON, DSPIC33AK_UART_CON_RXEN);
+    } else {
+        dspic33ak_uart_reg_clear(r->CON, DSPIC33AK_UART_CON_RXEN);
+    }
+    g_rx_enabled[inst] = enable;
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_is_enabled                                               */
+/* -------------------------------------------------------------------------- */
+bool dspic33ak_uart_tx_is_enabled(dspic33ak_uart_instance_t inst)
+{
+    if (uart_check_initialized(inst) != DSPIC33AK_UART_OK) {
+        return false;
+    }
+    return g_tx_enabled[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_is_enabled                                               */
+/* -------------------------------------------------------------------------- */
+bool dspic33ak_uart_rx_is_enabled(dspic33ak_uart_instance_t inst)
+{
+    if (uart_check_initialized(inst) != DSPIC33AK_UART_OK) {
+        return false;
+    }
+    return g_rx_enabled[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_set_baudrate                                                */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_set_baudrate(
+    dspic33ak_uart_instance_t inst,
+    uint32_t uart_clk_hz,
+    uint32_t baudrate)
+{
+    const dspic33ak_uart_regs_t *r;
+    dspic33ak_uart_status_t st;
+    uint32_t brg;
+
+    st = uart_require_initialized(inst, &r);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    if (uart_clk_hz == 0u || baudrate == 0u) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+
+    /* Never reconfigure the divisor under an active transfer or while a byte is
+     * still being shifted out. */
+    if (g_tx_busy[inst] || g_rx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+    if (!dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_TXMTIF) ||
+        !dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_TXBE)) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+
+    brg = uart_calc_brg(uart_clk_hz, baudrate);
+    if (brg == 0u) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+
+    *r->BRG = brg;
+    g_uart_clk_hz[inst] = uart_clk_hz;
+    g_baudrate[inst]    = baudrate;
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_get_baudrate                                                */
+/* -------------------------------------------------------------------------- */
+uint32_t dspic33ak_uart_get_baudrate(dspic33ak_uart_instance_t inst)
+{
+    if (uart_check_initialized(inst) != DSPIC33AK_UART_OK) {
+        return 0u;
+    }
+    return g_baudrate[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_start                                                    */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_tx_start(
+    dspic33ak_uart_instance_t inst,
+    const uint8_t *data,
+    size_t length)
+{
+    dspic33ak_uart_status_t st;
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+    if (data == 0 || length == 0u) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    if (g_tx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+    /* Async TX needs TX enabled and a usable (non-zero) TX interrupt priority;
+     * otherwise the transfer would never complete (no SEND_COMPLETE). Reject up
+     * front instead of returning a "started" transfer that silently stalls. */
+    if (!g_tx_enabled[inst]) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    if (g_tx_irq_priority[inst] == 0u) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+
+    /* Publish the transfer descriptor before arming the interrupt. */
+    g_tx_buf[inst]   = data;
+    g_tx_len[inst]   = length;
+    g_tx_count[inst] = 0u;
+    g_tx_busy[inst]  = true;
+
+    /* Arm the TX interrupt and software-trigger the first entry so the engine
+     * starts even if no "FIFO has space" interrupt is latched yet. */
+    (void)uart_tx_irq_clear_flag(inst);
+    if (!uart_tx_irq_enable(inst, true)) {
+        g_tx_busy[inst] = false;
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    (void)uart_tx_irq_raise_flag(inst);
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_abort                                                    */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_tx_abort(dspic33ak_uart_instance_t inst)
+{
+    dspic33ak_uart_status_t st;
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    (void)uart_tx_irq_enable(inst, false);
+    (void)uart_tx_irq_clear_flag(inst);
+    g_tx_busy[inst] = false;
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_count_get                                                */
+/* -------------------------------------------------------------------------- */
+size_t dspic33ak_uart_tx_count_get(dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return 0u;
+    }
+    return g_tx_count[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_is_busy                                                  */
+/* -------------------------------------------------------------------------- */
+bool dspic33ak_uart_tx_is_busy(dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return false;
+    }
+    return g_tx_busy[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_start                                                    */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_start(
+    dspic33ak_uart_instance_t inst,
+    uint8_t *data,
+    size_t length)
+{
+    dspic33ak_uart_status_t st;
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+    if (data == 0 || length == 0u) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    /* Async RX is fed from the RX ISR, which only runs in ISR ring mode. */
+    if (g_rx_mode[inst] != DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    /* RX must be enabled, or no bytes will arrive and the transfer never
+     * completes (no RX_COMPLETE). */
+    if (!g_rx_enabled[inst]) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    if (g_rx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+
+    /* Publish the descriptor, then arm. The RX interrupt is already enabled by
+     * the ISR ring backend; dspic33ak_uart_async_rx_feed() picks the bytes up as
+     * soon as g_rx_busy becomes true. */
+    g_rx_buf[inst]   = data;
+    g_rx_len[inst]   = length;
+    g_rx_count[inst] = 0u;
+    g_rx_busy[inst]  = true;
+
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_abort                                                    */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_abort(dspic33ak_uart_instance_t inst)
+{
+    dspic33ak_uart_status_t st;
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+
+    /* Single volatile flag write; the RX ISR re-checks it before each store. */
+    g_rx_busy[inst] = false;
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_count_get                                                */
+/* -------------------------------------------------------------------------- */
+size_t dspic33ak_uart_rx_count_get(dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return 0u;
+    }
+    return g_rx_count[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_is_busy                                                  */
+/* -------------------------------------------------------------------------- */
+bool dspic33ak_uart_rx_is_busy(dspic33ak_uart_instance_t inst)
+{
+    if (!uart_inst_is_valid(inst)) {
+        return false;
+    }
+    return g_rx_busy[inst];
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_tx_irq_handler                                              */
+/* -------------------------------------------------------------------------- */
+void dspic33ak_uart_tx_irq_handler(dspic33ak_uart_instance_t inst)
+{
+    const dspic33ak_uart_regs_t *r;
+
+    if (uart_get_regs(inst, &r) != DSPIC33AK_UART_OK) {
+        return;
+    }
+
+    (void)uart_tx_irq_clear_flag(inst);
+
+    /* Spurious / aborted: nothing to do but make sure the interrupt is off. */
+    if (!g_tx_busy[inst]) {
+        (void)uart_tx_irq_enable(inst, false);
+        return;
+    }
+
+    /* Push bytes while the TX FIFO can accept them and data remains. */
+    while ((g_tx_count[inst] < g_tx_len[inst]) &&
+           !dspic33ak_uart_reg_is_set(r->STAT, DSPIC33AK_UART_STAT_TXBF)) {
+        *r->TXB = (uint32_t)g_tx_buf[inst][g_tx_count[inst]];
+        g_tx_count[inst]++;
+    }
+
+    /* All bytes submitted to the FIFO: stop the interrupt and report complete.
+     * This is the CMSIS SEND_COMPLETE sense ("driver accepted and submitted all
+     * data"); physical shift-register-empty is still observable via
+     * dspic33ak_uart_tx_done(). */
+    if (g_tx_count[inst] >= g_tx_len[inst]) {
+        (void)uart_tx_irq_enable(inst, false);
+        g_tx_busy[inst] = false;
+        uart_notify(inst, DSPIC33AK_UART_EVENT_SEND_COMPLETE);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_async_rx_feed (internal ISR hook)                           */
+/* -------------------------------------------------------------------------- */
+bool dspic33ak_uart_async_rx_feed(dspic33ak_uart_instance_t inst, uint8_t byte)
+{
+    if (!uart_inst_is_valid(inst) || !g_rx_busy[inst]) {
+        return false;
+    }
+
+    g_rx_buf[inst][g_rx_count[inst]] = byte;
+    g_rx_count[inst]++;
+
+    if (g_rx_count[inst] >= g_rx_len[inst]) {
+        g_rx_busy[inst] = false;
+        uart_notify(inst, DSPIC33AK_UART_EVENT_RX_COMPLETE);
+    }
+
+    return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_async_notify_events (internal ISR hook)                     */
+/* -------------------------------------------------------------------------- */
+void dspic33ak_uart_async_notify_events(
+    dspic33ak_uart_instance_t inst,
+    uint32_t events)
+{
+    if (!uart_inst_is_valid(inst) || events == 0u) {
+        return;
+    }
+    uart_notify(inst, events);
+}
+
+/* ========================================================================== */
 /* Local Functions                                                            */
 /* ========================================================================== */
 
@@ -602,4 +1066,139 @@ static bool uart_timeout_expired(
 
     now = g_get_ms[inst]();
     return ((uint32_t)(now - start_ms) >= g_timeout_ms[inst]);
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_async_reset                                                           */
+/* -------------------------------------------------------------------------- */
+static void uart_async_reset(dspic33ak_uart_instance_t inst)
+{
+    g_tx_buf[inst]   = 0;
+    g_tx_len[inst]   = 0u;
+    g_tx_count[inst] = 0u;
+    g_tx_busy[inst]  = false;
+
+    g_rx_buf[inst]   = 0;
+    g_rx_len[inst]   = 0u;
+    g_rx_count[inst] = 0u;
+    g_rx_busy[inst]  = false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_notify                                                                */
+/* -------------------------------------------------------------------------- */
+static void uart_notify(dspic33ak_uart_instance_t inst, uint32_t events)
+{
+    dspic33ak_uart_event_callback_t cb = g_callback[inst];
+
+    if (cb != 0) {
+        cb(inst, events, g_callback_user_data[inst]);
+    }
+}
+
+/* ========================================================================== */
+/* Local Functions: TX interrupt Flag / Enable / Priority                     */
+/*                                                                            */
+/* The TX interrupt bits live in scattered CPU registers and do not index by   */
+/* instance, so the per-instance mapping is isolated here, mirroring the RX     */
+/* interrupt helpers in dspic33ak_uart_rx_isr_ring.c. Each helper returns false */
+/* when the instance has no TX interrupt mapping on this device (UART2/3/4      */
+/* cases are compiled in only when the corresponding _UxTXIF macro exists).     */
+/* ========================================================================== */
+
+/* -------------------------------------------------------------------------- */
+/* uart_tx_irq_set_priority                                                   */
+/* -------------------------------------------------------------------------- */
+static bool uart_tx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t prio)
+{
+    switch (inst) {
+#if defined(_U1TXIF)
+    case DSPIC33AK_UART_INST_1: _U1TXIP = prio; return true;
+#endif
+#if defined(_U2TXIF)
+    case DSPIC33AK_UART_INST_2: _U2TXIP = prio; return true;
+#endif
+#if defined(_U3TXIF)
+    case DSPIC33AK_UART_INST_3: _U3TXIP = prio; return true;
+#endif
+#if defined(_U4TXIF)
+    case DSPIC33AK_UART_INST_4: _U4TXIP = prio; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_tx_irq_clear_flag                                                      */
+/* -------------------------------------------------------------------------- */
+static bool uart_tx_irq_clear_flag(dspic33ak_uart_instance_t inst)
+{
+    switch (inst) {
+#if defined(_U1TXIF)
+    case DSPIC33AK_UART_INST_1: _U1TXIF = 0; return true;
+#endif
+#if defined(_U2TXIF)
+    case DSPIC33AK_UART_INST_2: _U2TXIF = 0; return true;
+#endif
+#if defined(_U3TXIF)
+    case DSPIC33AK_UART_INST_3: _U3TXIF = 0; return true;
+#endif
+#if defined(_U4TXIF)
+    case DSPIC33AK_UART_INST_4: _U4TXIF = 0; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_tx_irq_raise_flag                                                      */
+/*                                                                            */
+/* Software-set the TX interrupt flag to force the first ISR entry after the   */
+/* engine is armed (the FIFO-space condition may not latch a flag on enable).  */
+/* -------------------------------------------------------------------------- */
+static bool uart_tx_irq_raise_flag(dspic33ak_uart_instance_t inst)
+{
+    switch (inst) {
+#if defined(_U1TXIF)
+    case DSPIC33AK_UART_INST_1: _U1TXIF = 1; return true;
+#endif
+#if defined(_U2TXIF)
+    case DSPIC33AK_UART_INST_2: _U2TXIF = 1; return true;
+#endif
+#if defined(_U3TXIF)
+    case DSPIC33AK_UART_INST_3: _U3TXIF = 1; return true;
+#endif
+#if defined(_U4TXIF)
+    case DSPIC33AK_UART_INST_4: _U4TXIF = 1; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_tx_irq_enable                                                         */
+/* -------------------------------------------------------------------------- */
+static bool uart_tx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
+{
+    const uint8_t v = enable ? 1u : 0u;
+
+    switch (inst) {
+#if defined(_U1TXIF)
+    case DSPIC33AK_UART_INST_1: _U1TXIE = v; return true;
+#endif
+#if defined(_U2TXIF)
+    case DSPIC33AK_UART_INST_2: _U2TXIE = v; return true;
+#endif
+#if defined(_U3TXIF)
+    case DSPIC33AK_UART_INST_3: _U3TXIE = v; return true;
+#endif
+#if defined(_U4TXIF)
+    case DSPIC33AK_UART_INST_4: _U4TXIE = v; return true;
+#endif
+    default: break;
+    }
+    return false;
 }

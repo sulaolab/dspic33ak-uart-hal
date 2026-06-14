@@ -17,6 +17,9 @@ This version supports:
 * Caller-provided RX ring buffer storage
 * dsPIC33AK UART clock source through CLKGEN8
 * 8N1 byte-stream operation
+* Optional asynchronous (non-blocking) TX/RX transfer model with completion and
+  error events through a registered callback (additive; the byte-stream API and
+  RX ISR ring keep working unchanged)
 
 ## Repository layout
 
@@ -133,7 +136,15 @@ If your application defines an RX interrupt vector for ISR ring mode, that vecto
 #include "dspic33ak_uart_rx_isr_ring.h"
 ```
 
-The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally not include it directly.
+The header `dspic33ak_uart_reg.h` is an internal helper header used by the HAL implementation. It is part of the source distribution, but user application code should normally not include it directly. (The asynchronous engine's internal hooks are declared in `dspic33ak_uart_rx_isr_ring.h`; they are likewise not for application use.)
+
+If your application uses the asynchronous transfer model and starts TX transfers (`dspic33ak_uart_tx_start()`), the application-owned `_UxTXInterrupt` vector must call `dspic33ak_uart_tx_irq_handler()`, the same way the RX vector calls `dspic33ak_uart_rx_irq_handler()`.
+
+Async transfer-state rules:
+
+* Async TX requires TX enabled and a non-zero `tx_irq_priority`; otherwise `dspic33ak_uart_tx_start()` returns `DSPIC33AK_UART_ERR_UNSUPPORTED` (a transfer with no servicing interrupt would never complete).
+* Async RX requires RX enabled and ISR ring mode; otherwise `dspic33ak_uart_rx_start()` returns `DSPIC33AK_UART_ERR_UNSUPPORTED`.
+* `dspic33ak_uart_tx_enable(false)` / `dspic33ak_uart_rx_enable(false)` return `DSPIC33AK_UART_ERR_BUSY` while an async transfer is active, so a transfer is never stranded by disabling its line mid-flight.
 
 ## Minimal polling example
 
