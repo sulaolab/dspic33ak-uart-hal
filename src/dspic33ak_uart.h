@@ -312,10 +312,22 @@ dspic33ak_uart_status_t dspic33ak_uart_set_callback(
 
 /* ----- TX / RX line enable control ---------------------------------------- */
 
+/*
+ * Enable or disable TX.
+ *
+ * Disabling TX while an async TX transfer is active returns
+ * DSPIC33AK_UART_ERR_BUSY; abort or wait for completion first.
+ */
 dspic33ak_uart_status_t dspic33ak_uart_tx_enable(
     dspic33ak_uart_instance_t inst,
     bool enable);
 
+/*
+ * Enable or disable RX.
+ *
+ * Disabling RX while an async RX transfer is active returns
+ * DSPIC33AK_UART_ERR_BUSY; abort or wait for completion first.
+ */
 dspic33ak_uart_status_t dspic33ak_uart_rx_enable(
     dspic33ak_uart_instance_t inst,
     bool enable);
@@ -356,6 +368,7 @@ uint32_t dspic33ak_uart_get_baudrate(
  *
  *   _ERR_INVALID_ARG  data == NULL or length == 0
  *   _ERR_BUSY         a TX transfer is already active
+ *   _ERR_UNSUPPORTED  TX disabled or tx_irq_priority == 0
  *   _ERR_NOT_INITIALIZED / _ERR_NOT_PRESENT as usual
  *
  * This is independent of dspic33ak_uart_write()/_write_byte(); do not mix a
@@ -398,7 +411,7 @@ bool dspic33ak_uart_tx_is_busy(
  *
  *   _ERR_INVALID_ARG  data == NULL or length == 0
  *   _ERR_BUSY         an RX transfer is already active
- *   _ERR_UNSUPPORTED  instance is not in ISR ring RX mode
+ *   _ERR_UNSUPPORTED  instance is not in ISR ring RX mode, or RX is disabled
  *   _ERR_NOT_INITIALIZED / _ERR_NOT_PRESENT as usual
  */
 dspic33ak_uart_status_t dspic33ak_uart_rx_start(
