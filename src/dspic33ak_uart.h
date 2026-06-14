@@ -253,12 +253,18 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_status_clear(
  * specific middleware. No ARM_USART_* / ARM_DRIVER_* names appear here.
  *
  * Backend requirements:
- *   - Async RX requires the instance to run in DSPIC33AK_UART_RX_MODE_ISR_RING
- *     (the RX ISR feeds the async buffer). In polling mode dspic33ak_uart_rx_start()
- *     returns DSPIC33AK_UART_ERR_UNSUPPORTED.
- *   - Async TX requires the application to route the device TX interrupt vector
- *     to dspic33ak_uart_tx_irq_handler(), the same way the RX vector forwards to
+ *   - Async TX requires TX enabled and a non-zero tx_irq_priority; otherwise
+ *     dspic33ak_uart_tx_start() returns DSPIC33AK_UART_ERR_UNSUPPORTED (a transfer
+ *     with no servicing interrupt would never complete). It also requires the
+ *     application to route the device TX interrupt vector to
+ *     dspic33ak_uart_tx_irq_handler(), as the RX vector forwards to
  *     dspic33ak_uart_rx_irq_handler().
+ *   - Async RX requires RX enabled and DSPIC33AK_UART_RX_MODE_ISR_RING (the RX ISR
+ *     feeds the async buffer); otherwise dspic33ak_uart_rx_start() returns
+ *     DSPIC33AK_UART_ERR_UNSUPPORTED.
+ *   - dspic33ak_uart_tx_enable(false) / dspic33ak_uart_rx_enable(false) return
+ *     DSPIC33AK_UART_ERR_BUSY while an async transfer is active, so a transfer is
+ *     never stranded by disabling its line mid-flight.
  */
 
 /* Event bit-flags reported through the registered callback. Multiple bits may be

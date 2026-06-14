@@ -572,6 +572,12 @@ dspic33ak_uart_status_t dspic33ak_uart_tx_enable(
         return st;
     }
 
+    /* Disabling TX under an active async transfer would strand it (no
+     * SEND_COMPLETE); reject until the transfer finishes or is aborted. */
+    if (!enable && g_tx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+
     if (enable) {
         dspic33ak_uart_reg_set(r->CON, DSPIC33AK_UART_CON_TXEN);
     } else {
@@ -594,6 +600,12 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_enable(
     st = uart_require_initialized(inst, &r);
     if (st != DSPIC33AK_UART_OK) {
         return st;
+    }
+
+    /* Disabling RX under an active async transfer would strand it (no
+     * RX_COMPLETE); reject until the transfer finishes or is aborted. */
+    if (!enable && g_rx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
     }
 
     if (enable) {
@@ -700,6 +712,15 @@ dspic33ak_uart_status_t dspic33ak_uart_tx_start(
     if (g_tx_busy[inst]) {
         return DSPIC33AK_UART_ERR_BUSY;
     }
+    /* Async TX needs TX enabled and a usable (non-zero) TX interrupt priority;
+     * otherwise the transfer would never complete (no SEND_COMPLETE). Reject up
+     * front instead of returning a "started" transfer that silently stalls. */
+    if (!g_tx_enabled[inst]) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    if (g_tx_irq_priority[inst] == 0u) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
 
     /* Publish the transfer descriptor before arming the interrupt. */
     g_tx_buf[inst]   = data;
@@ -778,6 +799,11 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_start(
     }
     /* Async RX is fed from the RX ISR, which only runs in ISR ring mode. */
     if (g_rx_mode[inst] != DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    /* RX must be enabled, or no bytes will arrive and the transfer never
+     * completes (no RX_COMPLETE). */
+    if (!g_rx_enabled[inst]) {
         return DSPIC33AK_UART_ERR_UNSUPPORTED;
     }
     if (g_rx_busy[inst]) {
