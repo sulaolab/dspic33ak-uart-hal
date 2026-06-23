@@ -1,5 +1,10 @@
 # dspic33ak-uart-hal
 
+> Want to run it on hardware first?
+> Start with [dspic33ak-hal-starter](https://github.com/sulaolab/dspic33ak-hal-starter),
+> which vendors validated snapshots of the dsPIC33AK HAL repositories and
+> provides a ready-to-build MPLAB X project for the dsPIC33AK Curiosity board.
+
 Small, readable UART HAL for Microchip dsPIC33AK devices.
 
 This repository provides a reusable byte-stream UART driver with a clean public API. The public API avoids exposing XC-DSC / DFP bitfield types, while device-specific register mapping is isolated in small internal files.
