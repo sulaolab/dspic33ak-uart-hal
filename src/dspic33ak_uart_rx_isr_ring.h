@@ -27,30 +27,30 @@ extern "C" {
  * UART RX interrupt-driven ring HAL (dsPIC33AK).
  *
  * Provides the RX ISR ring core: a single-producer (ISR) / single-consumer
- * (reader) software ring fed by draining the RX FIFO, plus RX ISR runtime
- * status counters.
+ * (reader) software ring fed by draining the RX FIFO, plus the RX ISR ring
+ * runtime status counters.
  *
  * Design policy:
  *   - No printf / halt / blocking calls.
  *   - No application or board-specific dependencies.
  *   - No dynamic allocation; RX ring buffer storage is caller-provided.
  *   - No project-specific compile-time macros: the ring buffer storage, its size,
- *     interrupt priority, and RX backend selection stay in the board/application
- *     layer.
+ *     interrupt priority, and RX backend selection stay in the
+ *     board/application/integration layer.
  *   - The scattered RX interrupt Flag/Enable/Priority bits (_UxRXIF/IE/IP) are
  *     isolated inside small per-instance switch helpers in
  *     dspic33ak_uart_rx_isr_ring.c.
  *
  * Interrupt vector ownership:
- *   This HAL does NOT define the _UxRXInterrupt vector. The application owns the
- *   vector wrapper and calls dspic33ak_uart_rx_irq_handler() from it.
- *   dspic33ak_uart_rx_irq_handler() is an ordinary function, not an interrupt
- *   vector declaration.
+ *   This HAL does NOT define the _UxRXInterrupt vector. The application/integration
+ *   layer owns the thin vector wrapper and calls dspic33ak_uart_rx_irq_handler()
+ *   from it. dspic33ak_uart_rx_irq_handler() is an ordinary function, not an
+ *   interrupt vector declaration.
  *
  * Ring buffer ownership:
- *   The ring buffer storage is passed in through the UART config. This HAL only
- *   holds the buffer pointer, its size, and the read/write indices, so it consumes
- *   no implicit per-instance RAM for RX buffers that are never used.
+ *   The ring buffer storage is caller-provided (passed in via config). This HAL
+ *   only holds the buffer pointer, its size and the read/write indices, so it
+ *   consumes no implicit per-instance RAM for buffers that are never used.
  */
 
 /* ========================================================================== */
