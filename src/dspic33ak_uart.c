@@ -23,8 +23,9 @@ static bool g_initialized[DSPIC33AK_UART_INST_COUNT];
 static dspic33ak_uart_rx_mode_t g_rx_mode[DSPIC33AK_UART_INST_COUNT];
 
 /* ---- Asynchronous transfer model state (per instance) -------------------- *
- * All of this is inert until dspic33ak_uart_tx_start()/_rx_start() is used, so
- * it does not affect the byte-stream API or the RX ISR ring.
+ * All of this is inert until dspic33ak_uart_tx_start(), dspic33ak_uart_rx_start(),
+ * or dspic33ak_uart_rx_start_clean() is used, so it does not affect the
+ * byte-stream API or the RX ISR ring.
  *
  * Sharing with interrupt context: the TX ISR updates g_tx_count/g_tx_busy and
  * the RX ISR updates g_rx_count/g_rx_busy, so only those counters and flags are
@@ -75,12 +76,18 @@ static bool uart_timeout_expired(
     uint32_t start_ms);
 
 static void uart_async_reset(dspic33ak_uart_instance_t inst);
+static void uart_rx_arm(
+    dspic33ak_uart_instance_t inst,
+    uint8_t *data,
+    size_t length);
 static void uart_notify(dspic33ak_uart_instance_t inst, uint32_t events);
 
 static bool uart_tx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t prio);
 static bool uart_tx_irq_clear_flag(dspic33ak_uart_instance_t inst);
 static bool uart_tx_irq_raise_flag(dspic33ak_uart_instance_t inst);
 static bool uart_tx_irq_enable(dspic33ak_uart_instance_t inst, bool enable);
+static bool uart_rx_irq_enable(dspic33ak_uart_instance_t inst, bool enable);
+static uint8_t uart_rx_irq_get_enable(dspic33ak_uart_instance_t inst);
 
 /* ========================================================================== */
 /* Public Functions                                                           */
@@ -813,11 +820,53 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_start(
     /* Publish the descriptor, then arm. The RX interrupt is already enabled by
      * the ISR ring backend; dspic33ak_uart_async_rx_feed() picks the bytes up as
      * soon as g_rx_busy becomes true. */
-    g_rx_buf[inst]   = data;
-    g_rx_len[inst]   = length;
-    g_rx_count[inst] = 0u;
-    g_rx_busy[inst]  = true;
+    uart_rx_arm(inst, data, length);
 
+    return DSPIC33AK_UART_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* dspic33ak_uart_rx_start_clean                                              */
+/* -------------------------------------------------------------------------- */
+dspic33ak_uart_status_t dspic33ak_uart_rx_start_clean(
+    dspic33ak_uart_instance_t inst,
+    uint8_t *data,
+    size_t length)
+{
+    dspic33ak_uart_status_t st;
+    uint8_t rx_irq_enabled;
+
+    st = uart_check_initialized(inst);
+    if (st != DSPIC33AK_UART_OK) {
+        return st;
+    }
+    if (data == 0 || length == 0u) {
+        return DSPIC33AK_UART_ERR_INVALID_ARG;
+    }
+    if (g_rx_mode[inst] != DSPIC33AK_UART_RX_MODE_ISR_RING) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    if (!g_rx_enabled[inst]) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    if (g_rx_busy[inst]) {
+        return DSPIC33AK_UART_ERR_BUSY;
+    }
+
+    rx_irq_enabled = uart_rx_irq_get_enable(inst);
+    if (rx_irq_enabled == 0u) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+    if (!uart_rx_irq_enable(inst, false)) {
+        return DSPIC33AK_UART_ERR_UNSUPPORTED;
+    }
+
+    /* Drop bytes that predate this call, then arm while the RX ISR cannot move
+     * a just-arrived byte into the regular ring. */
+    dspic33ak_uart_rx_isr_flush(inst);
+    uart_rx_arm(inst, data, length);
+
+    (void)uart_rx_irq_enable(inst, (rx_irq_enabled != 0u));
     return DSPIC33AK_UART_OK;
 }
 
@@ -1085,6 +1134,20 @@ static void uart_async_reset(dspic33ak_uart_instance_t inst)
 }
 
 /* -------------------------------------------------------------------------- */
+/* uart_rx_arm                                                                */
+/* -------------------------------------------------------------------------- */
+static void uart_rx_arm(
+    dspic33ak_uart_instance_t inst,
+    uint8_t *data,
+    size_t length)
+{
+    g_rx_buf[inst]   = data;
+    g_rx_len[inst]   = length;
+    g_rx_count[inst] = 0u;
+    g_rx_busy[inst]  = true;
+}
+
+/* -------------------------------------------------------------------------- */
 /* uart_notify                                                                */
 /* -------------------------------------------------------------------------- */
 static void uart_notify(dspic33ak_uart_instance_t inst, uint32_t events)
@@ -1201,4 +1264,59 @@ static bool uart_tx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
     default: break;
     }
     return false;
+}
+
+/* ========================================================================== */
+/* Local Functions: RX interrupt Enable                                       */
+/*                                                                            */
+/* These mirror the RX ISR ring helpers so uart.c can make rx_start_clean() an */
+/* atomic operation across ring/FIFO flush and async descriptor publication.   */
+/* ========================================================================== */
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_irq_enable                                                         */
+/* -------------------------------------------------------------------------- */
+static bool uart_rx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
+{
+    const uint8_t v = enable ? 1u : 0u;
+
+    switch (inst) {
+#if defined(_U1RXIF)
+    case DSPIC33AK_UART_INST_1: _U1RXIE = v; return true;
+#endif
+#if defined(_U2RXIF)
+    case DSPIC33AK_UART_INST_2: _U2RXIE = v; return true;
+#endif
+#if defined(_U3RXIF)
+    case DSPIC33AK_UART_INST_3: _U3RXIE = v; return true;
+#endif
+#if defined(_U4RXIF)
+    case DSPIC33AK_UART_INST_4: _U4RXIE = v; return true;
+#endif
+    default: break;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* uart_rx_irq_get_enable                                                     */
+/* -------------------------------------------------------------------------- */
+static uint8_t uart_rx_irq_get_enable(dspic33ak_uart_instance_t inst)
+{
+    switch (inst) {
+#if defined(_U1RXIF)
+    case DSPIC33AK_UART_INST_1: return (uint8_t)_U1RXIE;
+#endif
+#if defined(_U2RXIF)
+    case DSPIC33AK_UART_INST_2: return (uint8_t)_U2RXIE;
+#endif
+#if defined(_U3RXIF)
+    case DSPIC33AK_UART_INST_3: return (uint8_t)_U3RXIE;
+#endif
+#if defined(_U4RXIF)
+    case DSPIC33AK_UART_INST_4: return (uint8_t)_U4RXIE;
+#endif
+    default: break;
+    }
+    return 0u;
 }

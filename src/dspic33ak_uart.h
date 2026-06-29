@@ -247,7 +247,8 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_status_clear(
  * This layer is purely additive and does NOT replace or change the byte-stream
  * API above. The blocking write byte path, the non-blocking read byte path and
  * the RX ISR ring keep working exactly as before; the async transfer engine is
- * inert until dspic33ak_uart_tx_start() / dspic33ak_uart_rx_start() is called.
+ * inert until dspic33ak_uart_tx_start(), dspic33ak_uart_rx_start(), or
+ * dspic33ak_uart_rx_start_clean() is called.
  *
  * Intentionally generic: the events and the API below describe a UART, not any
  * specific middleware. No ARM_USART_* / ARM_DRIVER_* names appear here.
@@ -405,9 +406,8 @@ bool dspic33ak_uart_tx_is_busy(
  * BY DESIGN, the transfer captures only bytes that arrive AFTER this call: bytes
  * already buffered in the RX ISR ring before rx_start() are NOT drained into the
  * async buffer and stay readable via the byte-stream API. A caller that wants the
- * async transfer to start from a clean slate must call dspic33ak_uart_rx_flush()
- * first. (A future CMSIS USART wrapper should rx_flush() before an async Receive
- * when only post-call bytes are wanted.)
+ * async transfer to start from a clean slate should use
+ * dspic33ak_uart_rx_start_clean(), which avoids a flush/start race window.
  *
  *   _ERR_INVALID_ARG  data == NULL or length == 0
  *   _ERR_BUSY         an RX transfer is already active
@@ -415,6 +415,26 @@ bool dspic33ak_uart_tx_is_busy(
  *   _ERR_NOT_INITIALIZED / _ERR_NOT_PRESENT as usual
  */
 dspic33ak_uart_status_t dspic33ak_uart_rx_start(
+    dspic33ak_uart_instance_t inst,
+    uint8_t *data,
+    size_t length);
+
+/*
+ * Start a clean non-blocking RX transfer. Bytes already buffered in the RX ISR
+ * ring or hardware FIFO are discarded, then the async RX descriptor is armed
+ * while the RX interrupt is held disabled.
+ *
+ * Bytes that arrive after the clean arm are captured by the new async transfer.
+ * The exact boundary is the end of the FIFO drain / descriptor publication, not
+ * the function entry point.
+ *
+ * This is intended for APIs such as CMSIS USART Receive(), where each receive
+ * operation should observe only bytes that arrive for that operation.
+ *
+ * Return codes match dspic33ak_uart_rx_start(); _ERR_UNSUPPORTED is also
+ * returned if the RX ISR is not currently enabled.
+ */
+dspic33ak_uart_status_t dspic33ak_uart_rx_start_clean(
     dspic33ak_uart_instance_t inst,
     uint8_t *data,
     size_t length);
