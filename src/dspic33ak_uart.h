@@ -422,8 +422,11 @@ dspic33ak_uart_status_t dspic33ak_uart_rx_start(
 /*
  * Start a clean non-blocking RX transfer. Bytes already buffered in the RX ISR
  * ring or hardware FIFO are discarded, then the async RX descriptor is armed
- * while the RX interrupt is held disabled. Bytes that arrive during this
- * transition remain in the FIFO and are captured by the new async transfer.
+ * while the RX interrupt is held disabled.
+ *
+ * Bytes that arrive after the clean arm are captured by the new async transfer.
+ * The exact boundary is the end of the FIFO drain / descriptor publication, not
+ * the function entry point.
  *
  * This is intended for APIs such as CMSIS USART Receive(), where each receive
  * operation should observe only bytes that arrive for that operation.

@@ -100,6 +100,17 @@ Buffer helpers:
 
 RX cleanup:
   dspic33ak_uart_rx_flush()
+
+Async transfers:
+  dspic33ak_uart_tx_start()
+  dspic33ak_uart_rx_start()
+  dspic33ak_uart_rx_start_clean()
+  dspic33ak_uart_tx_abort()
+  dspic33ak_uart_rx_abort()
+  dspic33ak_uart_tx_count_get()
+  dspic33ak_uart_rx_count_get()
+  dspic33ak_uart_tx_is_busy()
+  dspic33ak_uart_rx_is_busy()
 ```
 
 RX backend selection is configured per UART instance:
@@ -149,6 +160,7 @@ Async transfer-state rules:
 
 * Async TX requires TX enabled and a non-zero `tx_irq_priority`; otherwise `dspic33ak_uart_tx_start()` returns `DSPIC33AK_UART_ERR_UNSUPPORTED` (a transfer with no servicing interrupt would never complete).
 * Async RX requires RX enabled and ISR ring mode; otherwise `dspic33ak_uart_rx_start()` returns `DSPIC33AK_UART_ERR_UNSUPPORTED`.
+* `dspic33ak_uart_rx_start_clean()` is intended for framed/request-style receive APIs that want to discard old ring/FIFO bytes before arming a new async receive.
 * `dspic33ak_uart_tx_enable(false)` / `dspic33ak_uart_rx_enable(false)` return `DSPIC33AK_UART_ERR_BUSY` while an async transfer is active, so a transfer is never stranded by disabling its line mid-flight.
 
 ## Minimal polling example
