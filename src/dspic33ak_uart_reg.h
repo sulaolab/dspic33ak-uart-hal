@@ -30,11 +30,19 @@
 /* ========================================================================== */
 
 typedef struct {
+    volatile uint32_t *ifs;    /* interrupt flag register   (IFSx) */
+    volatile uint32_t *iec;    /* interrupt enable register (IECx) */
+    uint32_t           mask;   /* bit position, shared by IFS/IEC  */
+} dspic33ak_uart_irq_t;
+
+typedef struct {
     volatile uint32_t *CON;
     volatile uint32_t *STAT;
     volatile uint32_t *BRG;
     volatile uint32_t *TXB;
     volatile uint32_t *RXB;
+    dspic33ak_uart_irq_t irq_rx;
+    dspic33ak_uart_irq_t irq_tx;
 } dspic33ak_uart_regs_t;
 
 /* ========================================================================== */
@@ -99,6 +107,69 @@ static inline void dspic33ak_uart_reg_write_field(
     uint32_t value)
 {
     *reg = (*reg & ~mask) | (value & mask);
+}
+
+/* -------------------------------------------------------------------------- */
+/* UART interrupt source helpers                                              */
+/* -------------------------------------------------------------------------- */
+static inline bool dspic33ak_uart_reg_irq_is_mapped(
+    const dspic33ak_uart_irq_t *irq)
+{
+    return (irq != 0 && irq->ifs != 0 && irq->iec != 0 && irq->mask != 0u);
+}
+
+static inline bool dspic33ak_uart_reg_irq_enable(
+    const dspic33ak_uart_irq_t *irq)
+{
+    if (!dspic33ak_uart_reg_irq_is_mapped(irq)) {
+        return false;
+    }
+
+    *irq->iec |= irq->mask;
+    return true;
+}
+
+static inline bool dspic33ak_uart_reg_irq_disable(
+    const dspic33ak_uart_irq_t *irq)
+{
+    if (!dspic33ak_uart_reg_irq_is_mapped(irq)) {
+        return false;
+    }
+
+    *irq->iec &= ~irq->mask;
+    return true;
+}
+
+static inline bool dspic33ak_uart_reg_irq_clear(
+    const dspic33ak_uart_irq_t *irq)
+{
+    if (!dspic33ak_uart_reg_irq_is_mapped(irq)) {
+        return false;
+    }
+
+    *irq->ifs &= ~irq->mask;
+    return true;
+}
+
+static inline bool dspic33ak_uart_reg_irq_raise(
+    const dspic33ak_uart_irq_t *irq)
+{
+    if (!dspic33ak_uart_reg_irq_is_mapped(irq)) {
+        return false;
+    }
+
+    *irq->ifs |= irq->mask;
+    return true;
+}
+
+static inline uint8_t dspic33ak_uart_reg_irq_is_enabled(
+    const dspic33ak_uart_irq_t *irq)
+{
+    if (!dspic33ak_uart_reg_irq_is_mapped(irq)) {
+        return 0u;
+    }
+
+    return ((*irq->iec & irq->mask) != 0u) ? 1u : 0u;
 }
 
 #endif /* DSPIC33AK_UART_REG_H */
