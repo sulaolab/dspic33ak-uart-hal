@@ -11,9 +11,13 @@ This repository provides a reusable byte-stream UART driver with a clean public 
 
 ## Status
 
-Public release candidate.
+Hardware-validated release candidate.
 
-This HAL was developed and smoke-tested on a dsPIC33AK512MPS512 project using UART1. It is intended to be reusable across dsPIC33AK projects where the board/application code owns clock setup, PPS routing, GPIO setup, interrupt vector definitions, and stdio retargeting.
+The HAL core is hardware-validated through
+[dspic33ak-hal-starter](https://github.com/sulaolab/dspic33ak-hal-starter)
+on dsPIC33AK512MPS512 / UART1. It is intended to be reusable across
+dsPIC33AK projects where the board/application code owns clock setup, PPS
+routing, GPIO setup, interrupt vector definitions, and stdio retargeting.
 
 This version supports:
 
@@ -22,9 +26,24 @@ This version supports:
 * Caller-provided RX ring buffer storage
 * dsPIC33AK UART clock source through CLKGEN8
 * 8N1 byte-stream operation
+* Non-blocking async TX with `DSPIC33AK_UART_EVENT_SEND_COMPLETE`
+* Non-blocking async RX with `DSPIC33AK_UART_EVENT_RX_COMPLETE`
+* Active TX/RX abort and transfer byte counts
 * Optional asynchronous (non-blocking) TX/RX transfer model with completion and
   error events through a registered callback (additive; the byte-stream API and
   RX ISR ring keep working unchanged)
+
+Hardware validation currently covers:
+
+* Neutral, application-owned RX vector forwarding
+* Neutral, application-owned TX vector forwarding
+* RX ISR ring receive path
+* Async TX start, TX interrupt service, SEND_COMPLETE callback, exact TX count,
+  and physical TX done check
+* Async RX `start_clean`, RX interrupt service, RX_COMPLETE callback, exact RX
+  count, and received data match
+* Active RX abort
+* Return to normal printf / RX echo operation after async self-test cleanup
 
 ## Repository layout
 
@@ -37,6 +56,8 @@ src/
   dspic33ak_uart_reg.h          Internal register / bit-mask helper definitions
   dspic33ak_uart_rx_isr_ring.h  RX ISR ring backend API
   dspic33ak_uart_rx_isr_ring.c  RX ISR ring backend implementation
+examples/
+  uart_async_example.c           Minimal async TX/RX integration example
 ```
 
 ## Design policy
@@ -48,8 +69,11 @@ src/
 * No dynamic memory allocation is used.
 * RX ISR ring buffer storage is caller-provided.
 * Interrupt vector ownership stays outside this HAL.
-* The HAL does not define `_UxRXInterrupt`.
-* In ISR ring mode, the application-owned interrupt vector calls `dspic33ak_uart_rx_irq_handler()`.
+* The HAL does not define `_UxRXInterrupt` or `_UxTXInterrupt`.
+* In ISR ring mode, the application-owned RX interrupt vector calls
+  `dspic33ak_uart_rx_irq_handler()`.
+* When async TX is used, the application-owned TX interrupt vector calls
+  `dspic33ak_uart_tx_irq_handler()`.
 * Public functions are placed near the top of each source file. Static helper functions are placed near the bottom, with only prototypes near the top when needed.
 
 ## Clock assumption
@@ -100,6 +124,9 @@ Buffer helpers:
 
 RX cleanup:
   dspic33ak_uart_rx_flush()
+
+Events / callbacks:
+  dspic33ak_uart_set_callback()
 
 Async transfers:
   dspic33ak_uart_tx_start()
@@ -162,6 +189,21 @@ Async transfer-state rules:
 * Async RX requires RX enabled and ISR ring mode; otherwise `dspic33ak_uart_rx_start()` returns `DSPIC33AK_UART_ERR_UNSUPPORTED`.
 * `dspic33ak_uart_rx_start_clean()` is intended for framed/request-style receive APIs that want to discard old ring/FIFO bytes before arming a new async receive.
 * `dspic33ak_uart_tx_enable(false)` / `dspic33ak_uart_rx_enable(false)` return `DSPIC33AK_UART_ERR_BUSY` while an async transfer is active, so a transfer is never stranded by disabling its line mid-flight.
+* Register the callback after `dspic33ak_uart_init()`. Init and deinit clear callback state.
+* The callback may run from interrupt context. Keep it short and non-blocking:
+  record event bits or counters only. Do not call `printf()`, blocking I/O,
+  delay routines, or HAL APIs from inside the callback.
+* Async TX buffers must remain valid until the transfer completes or is aborted.
+* Do not mix `printf()`, blocking write, or `dspic33ak_uart_write_byte()` on the
+  same UART while an async TX transfer is active.
+* `DSPIC33AK_UART_EVENT_SEND_COMPLETE` means all bytes have been submitted to
+  the hardware FIFO/register. It does not guarantee physical line idle. Before
+  returning to blocking output, wait for SEND_COMPLETE and then confirm
+  `dspic33ak_uart_tx_done()`.
+* `dspic33ak_uart_rx_start_clean()` discards old RX ring data and hardware FIFO
+  data before arming the new receive. This is the preferred primitive for
+  CMSIS-style `Receive()` wrappers and other framed receive operations that
+  should observe only bytes arriving for that operation.
 
 ## Minimal polling example
 
@@ -279,6 +321,17 @@ if (dspic33ak_uart_read_byte(DSPIC33AK_UART_INST_1, &ch) == DSPIC33AK_UART_OK) {
 }
 ```
 
+## Minimal async TX/RX example
+
+For a compact integration sketch covering application-owned RX/TX vectors,
+RX ring storage, IRQ priorities, callback registration after init,
+SEND_COMPLETE, `tx_done()`, `rx_start_clean()`, RX_COMPLETE, aborts, and counts,
+see:
+
+```text
+examples/uart_async_example.c
+```
+
 ## Scope and limitations
 
 This repository provides a UART byte-stream HAL. It does not provide a complete board support package.
@@ -293,6 +346,11 @@ Current scope:
 * Non-blocking RX byte read
 * Polling RX backend
 * ISR software-ring RX backend
+* Non-blocking async TX
+* Non-blocking async RX
+* SEND_COMPLETE and RX_COMPLETE callback events
+* TX/RX abort
+* TX/RX transfer byte counts
 
 You still need project-specific code for:
 
@@ -312,6 +370,15 @@ The application must define the relevant `_UxRXInterrupt` vector and call:
 
 ```c
 dspic33ak_uart_rx_irq_handler(DSPIC33AK_UART_INST_1);
+```
+
+from that vector.
+
+When async TX is used, the application must also define the relevant
+`_UxTXInterrupt` vector and call:
+
+```c
+dspic33ak_uart_tx_irq_handler(DSPIC33AK_UART_INST_1);
 ```
 
 from that vector.
