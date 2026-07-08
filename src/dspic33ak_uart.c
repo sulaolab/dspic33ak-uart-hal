@@ -2,7 +2,6 @@
 /* Includes                                                                   */
 /* ========================================================================== */
 
-#include <xc.h>          /* TX interrupt Flag/Enable/Priority bits (async TX) */
 #include <string.h>
 
 #include "dspic33ak_uart.h"
@@ -1160,13 +1159,7 @@ static void uart_notify(dspic33ak_uart_instance_t inst, uint32_t events)
 }
 
 /* ========================================================================== */
-/* Local Functions: TX interrupt Flag / Enable / Priority                     */
-/*                                                                            */
-/* The TX interrupt bits live in scattered CPU registers and do not index by   */
-/* instance, so the per-instance mapping is isolated here, mirroring the RX     */
-/* interrupt helpers in dspic33ak_uart_rx_isr_ring.c. Each helper returns false */
-/* when the instance has no TX interrupt mapping on this device (UART2/3/4      */
-/* cases are compiled in only when the corresponding _UxTXIF macro exists).     */
+/* Local Functions: TX interrupt operations                                   */
 /* ========================================================================== */
 
 /* -------------------------------------------------------------------------- */
@@ -1174,22 +1167,7 @@ static void uart_notify(dspic33ak_uart_instance_t inst, uint32_t events)
 /* -------------------------------------------------------------------------- */
 static bool uart_tx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t prio)
 {
-    switch (inst) {
-#if defined(_U1TXIF)
-    case DSPIC33AK_UART_INST_1: _U1TXIP = prio; return true;
-#endif
-#if defined(_U2TXIF)
-    case DSPIC33AK_UART_INST_2: _U2TXIP = prio; return true;
-#endif
-#if defined(_U3TXIF)
-    case DSPIC33AK_UART_INST_3: _U3TXIP = prio; return true;
-#endif
-#if defined(_U4TXIF)
-    case DSPIC33AK_UART_INST_4: _U4TXIP = prio; return true;
-#endif
-    default: break;
-    }
-    return false;
+    return dspic33ak_uart_device_set_tx_irq_priority(inst, prio);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1197,22 +1175,9 @@ static bool uart_tx_irq_set_priority(dspic33ak_uart_instance_t inst, uint8_t pri
 /* -------------------------------------------------------------------------- */
 static bool uart_tx_irq_clear_flag(dspic33ak_uart_instance_t inst)
 {
-    switch (inst) {
-#if defined(_U1TXIF)
-    case DSPIC33AK_UART_INST_1: _U1TXIF = 0; return true;
-#endif
-#if defined(_U2TXIF)
-    case DSPIC33AK_UART_INST_2: _U2TXIF = 0; return true;
-#endif
-#if defined(_U3TXIF)
-    case DSPIC33AK_UART_INST_3: _U3TXIF = 0; return true;
-#endif
-#if defined(_U4TXIF)
-    case DSPIC33AK_UART_INST_4: _U4TXIF = 0; return true;
-#endif
-    default: break;
-    }
-    return false;
+    const dspic33ak_uart_device_t *dev = dspic33ak_uart_get_device(inst);
+
+    return (dev != 0) && dspic33ak_uart_reg_irq_clear(&dev->regs.irq_tx);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1223,22 +1188,9 @@ static bool uart_tx_irq_clear_flag(dspic33ak_uart_instance_t inst)
 /* -------------------------------------------------------------------------- */
 static bool uart_tx_irq_raise_flag(dspic33ak_uart_instance_t inst)
 {
-    switch (inst) {
-#if defined(_U1TXIF)
-    case DSPIC33AK_UART_INST_1: _U1TXIF = 1; return true;
-#endif
-#if defined(_U2TXIF)
-    case DSPIC33AK_UART_INST_2: _U2TXIF = 1; return true;
-#endif
-#if defined(_U3TXIF)
-    case DSPIC33AK_UART_INST_3: _U3TXIF = 1; return true;
-#endif
-#if defined(_U4TXIF)
-    case DSPIC33AK_UART_INST_4: _U4TXIF = 1; return true;
-#endif
-    default: break;
-    }
-    return false;
+    const dspic33ak_uart_device_t *dev = dspic33ak_uart_get_device(inst);
+
+    return (dev != 0) && dspic33ak_uart_reg_irq_raise(&dev->regs.irq_tx);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1246,31 +1198,19 @@ static bool uart_tx_irq_raise_flag(dspic33ak_uart_instance_t inst)
 /* -------------------------------------------------------------------------- */
 static bool uart_tx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
 {
-    const uint8_t v = enable ? 1u : 0u;
+    const dspic33ak_uart_device_t *dev = dspic33ak_uart_get_device(inst);
 
-    switch (inst) {
-#if defined(_U1TXIF)
-    case DSPIC33AK_UART_INST_1: _U1TXIE = v; return true;
-#endif
-#if defined(_U2TXIF)
-    case DSPIC33AK_UART_INST_2: _U2TXIE = v; return true;
-#endif
-#if defined(_U3TXIF)
-    case DSPIC33AK_UART_INST_3: _U3TXIE = v; return true;
-#endif
-#if defined(_U4TXIF)
-    case DSPIC33AK_UART_INST_4: _U4TXIE = v; return true;
-#endif
-    default: break;
+    if (dev == 0) {
+        return false;
     }
-    return false;
+
+    return enable ?
+        dspic33ak_uart_reg_irq_enable(&dev->regs.irq_tx) :
+        dspic33ak_uart_reg_irq_disable(&dev->regs.irq_tx);
 }
 
 /* ========================================================================== */
-/* Local Functions: RX interrupt Enable                                       */
-/*                                                                            */
-/* These mirror the RX ISR ring helpers so uart.c can make rx_start_clean() an */
-/* atomic operation across ring/FIFO flush and async descriptor publication.   */
+/* Local Functions: RX interrupt operations                                   */
 /* ========================================================================== */
 
 /* -------------------------------------------------------------------------- */
@@ -1278,24 +1218,15 @@ static bool uart_tx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
 /* -------------------------------------------------------------------------- */
 static bool uart_rx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
 {
-    const uint8_t v = enable ? 1u : 0u;
+    const dspic33ak_uart_device_t *dev = dspic33ak_uart_get_device(inst);
 
-    switch (inst) {
-#if defined(_U1RXIF)
-    case DSPIC33AK_UART_INST_1: _U1RXIE = v; return true;
-#endif
-#if defined(_U2RXIF)
-    case DSPIC33AK_UART_INST_2: _U2RXIE = v; return true;
-#endif
-#if defined(_U3RXIF)
-    case DSPIC33AK_UART_INST_3: _U3RXIE = v; return true;
-#endif
-#if defined(_U4RXIF)
-    case DSPIC33AK_UART_INST_4: _U4RXIE = v; return true;
-#endif
-    default: break;
+    if (dev == 0) {
+        return false;
     }
-    return false;
+
+    return enable ?
+        dspic33ak_uart_reg_irq_enable(&dev->regs.irq_rx) :
+        dspic33ak_uart_reg_irq_disable(&dev->regs.irq_rx);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1303,20 +1234,9 @@ static bool uart_rx_irq_enable(dspic33ak_uart_instance_t inst, bool enable)
 /* -------------------------------------------------------------------------- */
 static uint8_t uart_rx_irq_get_enable(dspic33ak_uart_instance_t inst)
 {
-    switch (inst) {
-#if defined(_U1RXIF)
-    case DSPIC33AK_UART_INST_1: return (uint8_t)_U1RXIE;
-#endif
-#if defined(_U2RXIF)
-    case DSPIC33AK_UART_INST_2: return (uint8_t)_U2RXIE;
-#endif
-#if defined(_U3RXIF)
-    case DSPIC33AK_UART_INST_3: return (uint8_t)_U3RXIE;
-#endif
-#if defined(_U4RXIF)
-    case DSPIC33AK_UART_INST_4: return (uint8_t)_U4RXIE;
-#endif
-    default: break;
-    }
-    return 0u;
+    const dspic33ak_uart_device_t *dev = dspic33ak_uart_get_device(inst);
+
+    return (dev != 0) ?
+        dspic33ak_uart_reg_irq_is_enabled(&dev->regs.irq_rx) :
+        0u;
 }

@@ -45,20 +45,43 @@ Hardware validation currently covers:
 * Active RX abort
 * Return to normal printf / RX echo operation after async self-test cleanup
 
+The same UART core was also integration-validated in the Perseus application
+through both the legacy UART initialization route and the CMSIS USART route.
+Application-level console RX remained functional while audio/TDM continued
+running with `TDM miss = 0`.
+
 ## Repository layout
 
 ```text
 src/
   dspic33ak_uart.h              Public UART HAL API
   dspic33ak_uart.c              UART HAL implementation
-  dspic33ak_uart_device.h       Device instance mapping interface
-  dspic33ak_uart_device.c       Device instance mapping implementation
+  dspic33ak_uart_device.h       Device / IRQ mapping interface
+  dspic33ak_uart_device.c       Device register and RX/TX IRQ mapping
   dspic33ak_uart_reg.h          Internal register / bit-mask helper definitions
   dspic33ak_uart_rx_isr_ring.h  RX ISR ring backend API
   dspic33ak_uart_rx_isr_ring.c  RX ISR ring backend implementation
 examples/
   uart_async_example.c           Minimal async TX/RX integration example
 ```
+
+## Device and IRQ mapping
+
+Device-specific UART peripheral and CPU interrupt mappings are isolated in
+`dspic33ak_uart_device.c`.
+
+For each supported UART instance, the device layer maps:
+
+* `UxCON` / `UxSTAT` / `UxBRG` / `UxTXB` / `UxRXB`
+* RX interrupt flag / enable / priority
+* TX interrupt flag / enable / priority
+
+The main UART logic and RX ISR-ring backend use the mapped register and IRQ
+descriptors instead of directly referencing raw `_UxRXIF`, `_UxTXIE`, or
+`_UxRXIP`-style symbols.
+
+Actual `_UxRXInterrupt` and `_UxTXInterrupt` vector definitions remain owned by
+the application or integration layer.
 
 ## Design policy
 

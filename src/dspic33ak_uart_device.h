@@ -36,6 +36,14 @@ const dspic33ak_uart_device_t *dspic33ak_uart_get_device(
 bool dspic33ak_uart_instance_is_present(
     dspic33ak_uart_instance_t inst);
 
+bool dspic33ak_uart_device_set_rx_irq_priority(
+    dspic33ak_uart_instance_t inst,
+    uint8_t priority);
+
+bool dspic33ak_uart_device_set_tx_irq_priority(
+    dspic33ak_uart_instance_t inst,
+    uint8_t priority);
+
 /* ========================================================================== */
 /* C++ Linkage                                                                */
 /* ========================================================================== */
