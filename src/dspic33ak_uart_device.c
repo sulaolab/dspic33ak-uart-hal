@@ -22,6 +22,20 @@
 /* Module Constants                                                           */
 /* ========================================================================== */
 
+/*
+ * Interrupt flag/enable descriptor per UART instance.
+ *
+ * The UART RX/TX interrupt flags live in different IFS/IEC banks depending on
+ * the device: on dsPIC33AK512MPS512 all UART flags are in IFS3/IEC3, while on
+ * dsPIC33AK128MC106 the U1/U2 flags are in IFS2/IEC2 (U3 stays in IFS3). The
+ * bank is therefore selected per (instance, direction) by whichever
+ * _IFSn_UxyIF_MASK the DFP defines: IFS3 first, then IFS2. Exactly one is
+ * defined per instance per device, so this is self-selecting; adding a device
+ * that uses another bank means adding one more #elif arm here. Leaving no arm
+ * matched (as happened for AK128 U1/U2 when only the IFS3 arm existed) zeroes
+ * the descriptor, which makes ISR-ring RX enable fail and unwinds uart init --
+ * i.e. the UART silently ends up disabled.
+ */
 static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] = {
 #if defined(U1CON)
     [DSPIC33AK_UART_INST_1] = {
@@ -34,9 +48,13 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .RXB = &U1RXB,
 #if defined(_U1RXIF) && defined(_IFS3_U1RXIF_MASK)
             .irq_rx = { &IFS3, &IEC3, _IFS3_U1RXIF_MASK },
+#elif defined(_U1RXIF) && defined(_IFS2_U1RXIF_MASK)
+            .irq_rx = { &IFS2, &IEC2, _IFS2_U1RXIF_MASK },
 #endif
 #if defined(_U1TXIF) && defined(_IFS3_U1TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U1TXIF_MASK },
+#elif defined(_U1TXIF) && defined(_IFS2_U1TXIF_MASK)
+            .irq_tx = { &IFS2, &IEC2, _IFS2_U1TXIF_MASK },
 #endif
         },
     },
@@ -55,9 +73,13 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .RXB = &U2RXB,
 #if defined(_U2RXIF) && defined(_IFS3_U2RXIF_MASK)
             .irq_rx = { &IFS3, &IEC3, _IFS3_U2RXIF_MASK },
+#elif defined(_U2RXIF) && defined(_IFS2_U2RXIF_MASK)
+            .irq_rx = { &IFS2, &IEC2, _IFS2_U2RXIF_MASK },
 #endif
 #if defined(_U2TXIF) && defined(_IFS3_U2TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U2TXIF_MASK },
+#elif defined(_U2TXIF) && defined(_IFS2_U2TXIF_MASK)
+            .irq_tx = { &IFS2, &IEC2, _IFS2_U2TXIF_MASK },
 #endif
         },
     },
@@ -76,9 +98,13 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .RXB = &U3RXB,
 #if defined(_U3RXIF) && defined(_IFS3_U3RXIF_MASK)
             .irq_rx = { &IFS3, &IEC3, _IFS3_U3RXIF_MASK },
+#elif defined(_U3RXIF) && defined(_IFS2_U3RXIF_MASK)
+            .irq_rx = { &IFS2, &IEC2, _IFS2_U3RXIF_MASK },
 #endif
 #if defined(_U3TXIF) && defined(_IFS3_U3TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U3TXIF_MASK },
+#elif defined(_U3TXIF) && defined(_IFS2_U3TXIF_MASK)
+            .irq_tx = { &IFS2, &IEC2, _IFS2_U3TXIF_MASK },
 #endif
         },
     },
@@ -97,9 +123,13 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .RXB = &U4RXB,
 #if defined(_U4RXIF) && defined(_IFS3_U4RXIF_MASK)
             .irq_rx = { &IFS3, &IEC3, _IFS3_U4RXIF_MASK },
+#elif defined(_U4RXIF) && defined(_IFS2_U4RXIF_MASK)
+            .irq_rx = { &IFS2, &IEC2, _IFS2_U4RXIF_MASK },
 #endif
 #if defined(_U4TXIF) && defined(_IFS3_U4TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U4TXIF_MASK },
+#elif defined(_U4TXIF) && defined(_IFS2_U4TXIF_MASK)
+            .irq_tx = { &IFS2, &IEC2, _IFS2_U4TXIF_MASK },
 #endif
         },
     },
