@@ -31,10 +31,11 @@
  * bank is therefore selected per (instance, direction) by whichever
  * _IFSn_UxyIF_MASK the DFP defines: IFS3 first, then IFS2. Exactly one is
  * defined per instance per device, so this is self-selecting; adding a device
- * that uses another bank means adding one more #elif arm here. Leaving no arm
- * matched (as happened for AK128 U1/U2 when only the IFS3 arm existed) zeroes
- * the descriptor, which makes ISR-ring RX enable fail and unwinds uart init --
- * i.e. the UART silently ends up disabled.
+ * that uses another bank means adding one more #elif arm here. If no arm matches
+ * for a present UART (as happened for AK128 U1/U2 when only the IFS3 arm existed)
+ * the #else arm fires a #error at build time -- previously the descriptor was left
+ * zeroed, which made ISR-ring RX enable fail and unwound uart init, silently
+ * disabling the UART. The build now stops instead of shipping a dead port.
  */
 static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] = {
 #if defined(U1CON)
@@ -50,11 +51,15 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .irq_rx = { &IFS3, &IEC3, _IFS3_U1RXIF_MASK },
 #elif defined(_U1RXIF) && defined(_IFS2_U1RXIF_MASK)
             .irq_rx = { &IFS2, &IEC2, _IFS2_U1RXIF_MASK },
+#else
+            #error "UART1 RX interrupt mapping is not implemented"
 #endif
 #if defined(_U1TXIF) && defined(_IFS3_U1TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U1TXIF_MASK },
 #elif defined(_U1TXIF) && defined(_IFS2_U1TXIF_MASK)
             .irq_tx = { &IFS2, &IEC2, _IFS2_U1TXIF_MASK },
+#else
+            #error "UART1 TX interrupt mapping is not implemented"
 #endif
         },
     },
@@ -75,11 +80,15 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .irq_rx = { &IFS3, &IEC3, _IFS3_U2RXIF_MASK },
 #elif defined(_U2RXIF) && defined(_IFS2_U2RXIF_MASK)
             .irq_rx = { &IFS2, &IEC2, _IFS2_U2RXIF_MASK },
+#else
+            #error "UART2 RX interrupt mapping is not implemented"
 #endif
 #if defined(_U2TXIF) && defined(_IFS3_U2TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U2TXIF_MASK },
 #elif defined(_U2TXIF) && defined(_IFS2_U2TXIF_MASK)
             .irq_tx = { &IFS2, &IEC2, _IFS2_U2TXIF_MASK },
+#else
+            #error "UART2 TX interrupt mapping is not implemented"
 #endif
         },
     },
@@ -100,11 +109,15 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .irq_rx = { &IFS3, &IEC3, _IFS3_U3RXIF_MASK },
 #elif defined(_U3RXIF) && defined(_IFS2_U3RXIF_MASK)
             .irq_rx = { &IFS2, &IEC2, _IFS2_U3RXIF_MASK },
+#else
+            #error "UART3 RX interrupt mapping is not implemented"
 #endif
 #if defined(_U3TXIF) && defined(_IFS3_U3TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U3TXIF_MASK },
 #elif defined(_U3TXIF) && defined(_IFS2_U3TXIF_MASK)
             .irq_tx = { &IFS2, &IEC2, _IFS2_U3TXIF_MASK },
+#else
+            #error "UART3 TX interrupt mapping is not implemented"
 #endif
         },
     },
@@ -125,11 +138,15 @@ static const dspic33ak_uart_device_t g_uart_devices[DSPIC33AK_UART_INST_COUNT] =
             .irq_rx = { &IFS3, &IEC3, _IFS3_U4RXIF_MASK },
 #elif defined(_U4RXIF) && defined(_IFS2_U4RXIF_MASK)
             .irq_rx = { &IFS2, &IEC2, _IFS2_U4RXIF_MASK },
+#else
+            #error "UART4 RX interrupt mapping is not implemented"
 #endif
 #if defined(_U4TXIF) && defined(_IFS3_U4TXIF_MASK)
             .irq_tx = { &IFS3, &IEC3, _IFS3_U4TXIF_MASK },
 #elif defined(_U4TXIF) && defined(_IFS2_U4TXIF_MASK)
             .irq_tx = { &IFS2, &IEC2, _IFS2_U4TXIF_MASK },
+#else
+            #error "UART4 TX interrupt mapping is not implemented"
 #endif
         },
     },
