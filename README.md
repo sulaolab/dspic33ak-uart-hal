@@ -1,4 +1,4 @@
-# dspic33ak-uart-hal
+# dspic33ak-hal-uart
 
 > Want to run it on hardware first?
 > Start with [dspic33ak-hal-starter](https://github.com/sulaolab/dspic33ak-hal-starter),
